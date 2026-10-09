@@ -2,3 +2,4 @@ libmeshraster.so
 .auto/
 bench/data/
 bench/bench
+bench/ref/

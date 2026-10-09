@@ -11,7 +11,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out_dir="${XDG_DATA_HOME:-$HOME/.local/share}/thumbnailers"
 mkdir -p "$out_dir"
 
-gcc -O2 -fPIC -shared -s -Wall -o "$here/libmeshraster.so" "$here/raster.c" -lm
+gcc $(cat "$here/cflags") -shared -s -o "$here/libmeshraster.so" "$here/raster.c" -lm -lpthread
 
 python3 -I - "$here" "$out_dir/oma-peek.thumbnailer" <<'EOF'
 import base64, sys, zlib
