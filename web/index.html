@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>oma-peek</title>
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.min.js" } }
+</script>
+<style>
+  :root {
+    --bg: #1e1e1e; --bg2: #161616; --panel: #252525; --fg: #e6e6e6;
+    --muted: #8a8a8a; --sel: #3a3a3a; --accent: #f38d70;
+  }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg);
+    color: var(--fg); font: 13px/1.35 system-ui, sans-serif; user-select: none; }
+  #app { display: flex; height: 100%; }
+  #side { width: 210px; flex: none; background: var(--panel); overflow-y: auto;
+    border-right: 1px solid var(--sel); padding: 8px 0; }
+  #side[hidden] { display: none; }
+  #side h2 { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+    color: var(--muted); margin: 10px 14px 4px; }
+  #side button { display: flex; align-items: center; gap: 8px; width: 100%; border: 0;
+    background: none; color: inherit; font: inherit; text-align: left; padding: 5px 14px;
+    cursor: pointer; }
+  #side button:hover { background: var(--sel); }
+  #side button.active { background: var(--sel); box-shadow: inset 3px 0 0 var(--accent); }
+  #side button.dim { opacity: .45; }
+  #side .dot { width: 10px; height: 10px; border-radius: 50%; flex: none;
+    box-shadow: 0 0 0 1px rgba(255,255,255,.25); }
+  #side .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #side .count { margin-left: auto; color: var(--muted); font-size: 11px; }
+  #view { position: relative; flex: 1; min-width: 0;
+    background: radial-gradient(ellipse at 50% 35%, var(--bg) 0%, var(--bg2) 100%); }
+  canvas { display: block; width: 100%; height: 100%; }
+  #info { position: absolute; left: 12px; bottom: 10px; color: var(--muted); font-size: 12px;
+    pointer-events: none; text-shadow: 0 1px 2px rgba(0,0,0,.6); }
+  #info b { color: var(--fg); font-weight: 600; }
+  #msg { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
+    text-align: center; padding: 24px; }
+  #msg[hidden] { display: none; }
+  #msg.error { color: var(--accent); white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="app">
+  <nav id="side" hidden></nav>
+  <main id="view">
+    <div id="msg">Loading…</div>
+    <div id="info"></div>
+  </main>
+</div>
+<script type="module" src="./viewer.js"></script>
+</body>
+</html>

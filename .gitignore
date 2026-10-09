@@ -1,0 +1,4 @@
+libmeshraster.so
+.auto/
+bench/data/
+bench/bench
