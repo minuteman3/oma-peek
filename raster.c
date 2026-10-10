@@ -10,10 +10,12 @@
 //   out     w*h RGBA, zeroed by the caller
 //   zbuf    w*h floats, filled with -FLT_MAX by the caller
 
+#include <float.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 static inline float edge(float ax, float ay, float bx, float by, float px, float py)
@@ -411,6 +413,154 @@ int mp_render(int nparts, const int *counts, const uint8_t *colours, const float
     int drawn = mp_raster((int)m, xs, ys, zs, rgb, res, res, out, zbuf);
     free(xs); free(ys); free(zs); free(rgb);
     return drawn;
+}
+
+// --- downsample ----------------------------------------------------------------
+//
+// Premultiplied k x k box filter from the supersampled render (src: res x res RGBA,
+// res = size * k) to dst (size x size RGBA). Same arithmetic as the numpy fallback.
+
+void mp_downsample(const uint8_t *src, int size, int k, uint8_t *dst)
+{
+    int res = size * k;
+    float inv = 1.0f / (k * k);
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            float r = 0, g = 0, b = 0, a = 0;
+            for (int j = 0; j < k; j++) {
+                const uint8_t *p = src + ((long)(y * k + j) * res + x * k) * 4;
+                for (int i = 0; i < k; i++, p += 4) {
+                    float pa = p[3] * (1.0f / 255);
+                    r += p[0] * pa; g += p[1] * pa; b += p[2] * pa; a += p[3];
+                }
+            }
+            r *= inv; g *= inv; b *= inv; a *= inv;
+            uint8_t *q = dst + ((long)y * size + x) * 4;
+            if (a > 0) {
+                float un = 255.0f / (a < 1 ? 1 : a);
+                float vr = r * un + 0.5f, vg = g * un + 0.5f, vb = b * un + 0.5f;
+                q[0] = (uint8_t)(vr > 255 ? 255 : vr);
+                q[1] = (uint8_t)(vg > 255 ? 255 : vg);
+                q[2] = (uint8_t)(vb > 255 ? 255 : vb);
+            } else {
+                q[0] = q[1] = q[2] = 0;
+            }
+            float va = a + 0.5f;
+            q[3] = (uint8_t)(va > 255 ? 255 : va);
+        }
+    }
+}
+
+// --- whole thumbnail ------------------------------------------------------------
+//
+// render (3x supersampled) -> downsample -> composite onto the backdrop -> PNG
+// scanlines (filter byte 0 + RGB per row), so a binary STL thumbnail needs no
+// numpy in the Python caller. raw must hold size * (1 + 3 * size) bytes.
+
+static void backdrop_rows(const uint8_t *im, int size, uint8_t *raw)
+{
+    static const float top[3] = {58, 58, 62}, bottom[3] = {34, 34, 38};
+    for (int y = 0; y < size; y++) {
+        float t = size > 1 ? (float)y / (size - 1) : 0;
+        float bg[3];
+        for (int c = 0; c < 3; c++) bg[c] = top[c] * (1 - t) + bottom[c] * t;
+        uint8_t *row = raw + (long)y * (1 + 3 * size);
+        row[0] = 0;
+        for (int x = 0; x < size; x++) {
+            const uint8_t *p = im + ((long)y * size + x) * 4;
+            float a = p[3] / 255.0f;
+            for (int c = 0; c < 3; c++) {
+                float v = p[c] * a + bg[c] * (1 - a) + 0.5f;
+                row[1 + x * 3 + c] = (uint8_t)(v > 255 ? 255 : v);
+            }
+        }
+    }
+}
+
+// Render + downsample to a size x size RGBA image (transparent background).
+// Returns 0, -1 if every triangle is degenerate, -2 on allocation failure.
+int mp_render_rgba(int nparts, const int *counts, const uint8_t *colours, const float *tris,
+                   int size, const double *view, const double *light, uint8_t *rgba)
+{
+    int k = 3, res = size * k;
+    uint8_t *out = calloc((size_t)res * res, 4);
+    float *zbuf = malloc((size_t)res * res * sizeof(float));
+    if (!out || !zbuf) {
+        free(out); free(zbuf);
+        return -2;
+    }
+    for (long i = 0; i < (long)res * res; i++) zbuf[i] = -FLT_MAX;
+    int r = mp_render(nparts, counts, colours, tris, res, view, light, out, zbuf);
+    if (r >= 0) {
+        mp_downsample(out, size, k, rgba);
+        r = 0;
+    }
+    free(out); free(zbuf);
+    return r;
+}
+
+void mp_backdrop(const uint8_t *rgba, int size, uint8_t *raw)
+{
+    backdrop_rows(rgba, size, raw);
+}
+
+int mp_thumb(int nparts, const int *counts, const uint8_t *colours, const float *tris,
+             int size, const double *view, const double *light, uint8_t *raw)
+{
+    uint8_t *small = malloc((size_t)size * size * 4);
+    if (!small)
+        return -2;
+    int r = mp_render_rgba(nparts, counts, colours, tris, size, view, light, small);
+    if (r == 0)
+        backdrop_rows(small, size, raw);
+    free(small);
+    return r;
+}
+
+// Apply a 3MF affine transform (row-vector convention: 3x3 then translation,
+// 12 doubles) to a mesh and gather its triangles as 9 floats each. Triangles with
+// out-of-range indices are skipped. Returns triangles written.
+long mp_emit(const float *v, long nv, const int64_t *t, long nt, const double *m, float *out)
+{
+    long w = 0;
+    for (long i = 0; i < nt; i++) {
+        int64_t a = t[i * 3], b = t[i * 3 + 1], c = t[i * 3 + 2];
+        if (a < 0 || b < 0 || c < 0 || a >= nv || b >= nv || c >= nv)
+            continue;
+        int64_t idx[3] = {a, b, c};
+        float *o = out + w * 9;
+        for (int j = 0; j < 3; j++) {
+            const float *p = v + idx[j] * 3;
+            double x = p[0], y = p[1], z = p[2];
+            o[j * 3] = (float)(x * m[0] + y * m[3] + z * m[6] + m[9]);
+            o[j * 3 + 1] = (float)(x * m[1] + y * m[4] + z * m[7] + m[10]);
+            o[j * 3 + 2] = (float)(x * m[2] + y * m[5] + z * m[8] + m[11]);
+        }
+        w++;
+    }
+    return w;
+}
+
+// Binary STL straight from the file bytes. Returns -3 if it isn't binary STL
+// (the caller then uses the general path, e.g. for ASCII STL).
+int mp_thumb_stl(const uint8_t *data, long len, const uint8_t *colour, int size,
+                 const double *view, const double *light, uint8_t *raw)
+{
+    if (len < 84)
+        return -3;
+    uint32_t n;
+    memcpy(&n, data + 80, 4);
+    if (n == 0 || (long)n * 50 + 84 != len)
+        return -3;
+    float *tris = malloc((size_t)n * 36);
+    if (!tris)
+        return -2;
+    for (uint32_t i = 0; i < n; i++)
+        memcpy(tris + (size_t)i * 9, data + 84 + (size_t)i * 50 + 12, 36);
+    int count = (int)n;
+    int r = mp_thumb(1, &count, colour, tris, size, view, light, raw);
+    free(tris);
+    return r;
 }
 
 // --- inflate via libdeflate -------------------------------------------------------

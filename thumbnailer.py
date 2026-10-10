@@ -15,20 +15,18 @@ import math
 import os
 import sys
 
-import numpy as np
-
 
 class _Lazy:
     """Import a module on first use: STL/OBJ thumbnails never need re, json,
     zipfile or subprocess, and every import is paid per thumbnail process."""
 
-    def __init__(self, name):
-        self._name = name
+    def __init__(self, name, alias=None):
+        self._name, self._alias = name, alias or name
 
     def __getattr__(self, attr):
         import importlib
         mod = importlib.import_module(self._name)
-        globals()[self._name] = mod
+        globals()[self._alias] = mod
         return getattr(mod, attr)
 
 
@@ -36,13 +34,14 @@ json = _Lazy('json')
 re = _Lazy('re')
 subprocess = _Lazy('subprocess')
 zipfile = _Lazy('zipfile')
+np = _Lazy('numpy', 'np')        # binary STL thumbnails never import numpy (~90 ms)
 
 DEFAULT_COLOUR = (185, 192, 200)
 
 # Compressed libmeshraster.so (base64 of zlib), filled in by install.sh.
 _NATIVE_SO = None
-VIEW_DIR = np.array([0.75, -1.05, 0.62])   # printer coords, Z up: front-right, above
-LIGHT = np.array([0.35, -0.55, 0.9])
+VIEW_DIR = (0.75, -1.05, 0.62)   # printer coords, Z up: front-right, above
+LIGHT = (0.35, -0.55, 0.9)
 
 
 # --- geometry loaders: return list of parts {tris: (n,3,3) float32, colour, plate} ---
@@ -84,15 +83,31 @@ def attrs(s):
     return dict(re.findall(ATTR, s))
 
 
+IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+
+
 def transform(s):
+    """3MF transform attribute -> 12-tuple (row-vector convention: 3x3, then translation)."""
     try:
-        t = [float(x) for x in (s or '').split()]
+        t = tuple(float(x) for x in (s or '').split())
     except ValueError:
-        t = []
-    if len(t) != 12:
-        return np.eye(4)
+        t = ()
+    return t if len(t) == 12 else IDENTITY
+
+
+def compose(a, b):
+    """Transform applying a first, then b."""
+    c = [0.0] * 12
+    for i in range(4):
+        for j in range(3):
+            v = sum(a[i * 3 + k] * b[k * 3 + j] for k in range(3))
+            c[i * 3 + j] = v + (b[9 + j] if i == 3 else 0.0)
+    return tuple(c)
+
+
+def mat4(t):
     m = np.eye(4)
-    m[:3, :3] = np.array(t[:9]).reshape(3, 3)   # row-vector convention
+    m[:3, :3] = np.array(t[:9]).reshape(3, 3)
     m[3, :3] = t[9:]
     return m
 
@@ -164,7 +179,7 @@ def parse_model(data):
         has_mesh = data.find(b'<mesh', b0, b1) >= 0      # found near the start when present
         native = parse_mesh_native(data, b0, b1) if has_mesh else None
         if native is not None:
-            if len(native[0]) and len(native[1]):
+            if native.nv and native.nt:
                 obj['mesh'] = native
         elif has_mesh:
             text = data[b0:b1].decode('utf-8', 'replace')
@@ -311,15 +326,19 @@ def load_3mf(path):
         obj = objs.get(oid)
         if not obj:
             return
-        if obj['mesh'] is not None:
-            v, f = obj['mesh']
+        mesh = obj['mesh']
+        if isinstance(mesh, RawMesh):
+            out.append(emit_native(mesh, m))
+        elif mesh is not None:
+            v, f = mesh
+            m4 = mat4(m)
             # float32 throughout: 3x3 + translation instead of float64 homogeneous coords.
-            vt = v @ m[:3, :3].astype(np.float32) + m[3, :3].astype(np.float32)
+            vt = v @ m4[:3, :3].astype(np.float32) + m4[3, :3].astype(np.float32)
             if f.size and f.max() >= len(v):
                 f = f[(f < len(v)).all(axis=1)]
             out.append(np.take(vt, f, axis=0))
         for cid, cp, ct in obj['comps']:
-            emit(out, cp or p, cid, ct @ m)
+            emit(out, cp or p, cid, compose(ct, m))
 
     parts, seen = [], {}
     for oid, p, m in build:
@@ -334,22 +353,28 @@ def load_3mf(path):
         plate = 0
         if plates:
             plate = next((i for i, s in enumerate(plates) if f'{oid}#{k}' in s), 0)
-        parts.append(dict(tris=np.concatenate(out), colour=colour, plate=plate))
+        if all(isinstance(o, RawTris) for o in out):
+            tris = RawTris(b''.join(o.data for o in out), sum(o.n for o in out))
+        else:
+            tris = np.concatenate([o.array() if isinstance(o, RawTris) else o for o in out])
+        parts.append(dict(tris=tris, colour=colour, plate=plate))
     if beds and parts:
         for part in parts:
-            c = part['tris'].reshape(-1, 3).mean(axis=0)
+            t = part['tris']
+            c = (t.array() if isinstance(t, RawTris) else t).reshape(-1, 3).mean(axis=0)
             d = [((c[0] - x) ** 2 + (c[1] - y) ** 2) + (1e12 if c[0] < x - 1 or c[1] < y - 1 else 0) for x, y in beds]
             part['plate'] = int(np.argmin(d))
     return parts
 
 
-def load_scad(path, workdir):
+def scad_to_stl(path, workdir):
+    """Render with OpenSCAD to binary STL bytes (binary so the C STL path can take it)."""
     out = os.path.join(workdir, '.oma-peek-scad.stl')
     try:
-        subprocess.run(['openscad', '-o', out, path], timeout=60, check=True,
+        subprocess.run(['openscad', '--export-format', 'binstl', '-o', out, path], timeout=60, check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with open(out, 'rb') as f:
-            return load_stl(f.read())
+            return f.read()
     finally:
         if os.path.exists(out):
             os.unlink(out)
@@ -379,14 +404,28 @@ def native_lib():
     except (OSError, AttributeError, ValueError) as e:
         print(f'oma-peek: native helpers unavailable ({e}), using numpy', file=sys.stderr)
         return None
-    lib.mp_raster.restype = ctypes.c_int
-    lib.mp_raster.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 4 + [ctypes.c_int, ctypes.c_int] + [ctypes.c_void_p] * 2
-    lib.mp_render.restype = ctypes.c_int
-    lib.mp_render.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 3 + [ctypes.c_int] + [ctypes.c_void_p] * 4
-    lib.mp_parse_mesh.restype = ctypes.c_int
-    lib.mp_parse_mesh.argtypes = [ctypes.c_void_p, ctypes.c_long] + [ctypes.c_void_p] * 4
-    lib.mp_inflate.restype = ctypes.c_long
-    lib.mp_inflate.argtypes = [ctypes.c_char_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_long]
+    try:
+        lib.mp_raster.restype = ctypes.c_int
+        lib.mp_raster.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 4 + [ctypes.c_int, ctypes.c_int] + [ctypes.c_void_p] * 2
+        lib.mp_render.restype = ctypes.c_int
+        lib.mp_render.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 3 + [ctypes.c_int] + [ctypes.c_void_p] * 4
+        lib.mp_parse_mesh.restype = ctypes.c_int
+        lib.mp_parse_mesh.argtypes = [ctypes.c_void_p, ctypes.c_long] + [ctypes.c_void_p] * 4
+        lib.mp_downsample.restype = None
+        lib.mp_downsample.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        lib.mp_thumb_stl.restype = ctypes.c_int
+        lib.mp_thumb_stl.argtypes = [ctypes.c_char_p, ctypes.c_long] + [ctypes.c_void_p] * 1 + [ctypes.c_int] + [ctypes.c_void_p] * 3
+        lib.mp_render_rgba.restype = ctypes.c_int
+        lib.mp_render_rgba.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 2 + [ctypes.c_char_p, ctypes.c_int] + [ctypes.c_void_p] * 3
+        lib.mp_backdrop.restype = None
+        lib.mp_backdrop.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        lib.mp_emit.restype = ctypes.c_long
+        lib.mp_emit.argtypes = [ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+        lib.mp_inflate.restype = ctypes.c_long
+        lib.mp_inflate.argtypes = [ctypes.c_char_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_long]
+    except AttributeError as e:    # stale or partial library: use the numpy path
+        print(f'oma-peek: native helpers incomplete ({e}), using numpy', file=sys.stderr)
+        return None
     _lib[0] = lib
     return lib
 
@@ -394,6 +433,42 @@ def native_lib():
 def native_raster():
     lib = native_lib()
     return lib.mp_raster if lib else None
+
+
+class RawMesh:
+    """Mesh parsed by C: vertices as float32 x,y,z and triangles as int64 indices, in bytearrays."""
+    __slots__ = ('v', 'nv', 't', 'nt')
+
+    def __init__(self, v, nv, t, nt):
+        self.v, self.nv, self.t, self.nt = v, nv, t, nt
+
+
+class RawTris:
+    """n triangles as packed float32 (9 per triangle) in a bytes-like object."""
+    __slots__ = ('data', 'n')
+
+    def __init__(self, data, n):
+        self.data, self.n = data, n
+
+    def __len__(self):
+        return self.n
+
+    def array(self):
+        return np.frombuffer(self.data, np.float32).reshape(-1, 3, 3)
+
+
+def emit_native(mesh, m):
+    import ctypes
+    lib = native_lib()
+    out = bytearray(mesh.nt * 36)
+    vb = (ctypes.c_char * len(mesh.v)).from_buffer(mesh.v)
+    tb = (ctypes.c_char * len(mesh.t)).from_buffer(mesh.t)
+    ob = (ctypes.c_char * len(out)).from_buffer(out)
+    w = lib.mp_emit(vb, mesh.nv, tb, mesh.nt, (ctypes.c_double * 12)(*m), ob)
+    del vb, tb, ob
+    if w < mesh.nt:
+        del out[w * 36:]
+    return RawTris(out, w)
 
 
 def parse_mesh_native(data, b0, b1):
@@ -411,11 +486,13 @@ def parse_mesh_native(data, b0, b1):
     ptr, n = base + b0, b1 - b0
     nv, nt = ctypes.c_long(), ctypes.c_long()
     lib.mp_parse_mesh(ptr, n, None, ctypes.byref(nv), None, ctypes.byref(nt))
-    v = np.empty((nv.value, 3), dtype=np.float32)
-    t = np.empty((nt.value, 3), dtype=np.int64)
-    lib.mp_parse_mesh(ptr, n, v.ctypes.data, ctypes.byref(nv), t.ctypes.data, ctypes.byref(nt))
-    del keep
-    return v, t
+    v = bytearray(nv.value * 12)
+    t = bytearray(nt.value * 24)
+    vb = (ctypes.c_char * len(v)).from_buffer(v) if v else None
+    tb = (ctypes.c_char * len(t)).from_buffer(t) if t else None
+    lib.mp_parse_mesh(ptr, n, vb, ctypes.byref(nv), tb, ctypes.byref(nt))
+    del keep, vb, tb
+    return RawMesh(v, nv.value, t, nt.value)
 
 
 def raster_native(fn, px, py, sz, rgb, res):
@@ -546,6 +623,11 @@ def render(parts, size):
 def downsample(out, size):
     """Premultiplied box filter from the supersampled render (res = size * k) to size."""
     k = out.shape[0] // size
+    lib = native_lib()
+    if lib and out.flags['C_CONTIGUOUS'] and out.shape[0] == size * k:
+        dst = np.empty((size, size, 4), np.uint8)
+        lib.mp_downsample(out.ctypes.data, size, k, dst.ctypes.data)
+        return dst
     pre = out[:size * k, :size * k].astype(np.float32)
     pre[..., :3] *= pre[..., 3:] / 255
     small = pre.reshape(size, k, size, k, 4).mean(axis=(1, 3))
@@ -555,6 +637,8 @@ def downsample(out, size):
 
 
 def render_plates(parts, size):
+    if any(isinstance(p['tris'], RawTris) for p in parts):
+        parts = [dict(p, tris=p['tris'].array()) if isinstance(p['tris'], RawTris) else p for p in parts]
     plates = sorted({p['plate'] for p in parts})
     if len(plates) <= 1:
         return render(parts, size)
@@ -581,6 +665,85 @@ def with_background(im):
     a = im[..., 3:].astype(np.float32) / 255
     rgb = im[..., :3] * a + bg * (1 - a)
     return np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
+
+
+def write_png_rows(path, raw, w, h):
+    """PNG from ready-made scanlines (filter byte + RGB per row)."""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data))
+    with open(path, 'wb') as f:
+        f.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                + chunk(b'IDAT', zlib.compress(bytes(raw), 6)) + chunk(b'IEND', b''))
+
+
+def thumb_parts_native(parts, size, dst):
+    """3MF parts (RawTris) -> PNG in C, plate grid included; no numpy. False if not applicable."""
+    import ctypes
+    lib = native_lib()
+    if not lib or not all(isinstance(p['tris'], RawTris) for p in parts):
+        return False
+    view, light = (ctypes.c_double * 3)(*VIEW_DIR), (ctypes.c_double * 3)(*LIGHT)
+
+    def render_rgba(group, cell):
+        data = group[0]['tris'].data if len(group) == 1 else b''.join(p['tris'].data for p in group)
+        counts = (ctypes.c_int * len(group))(*[p['tris'].n for p in group])
+        cols = (ctypes.c_uint8 * (3 * len(group)))(*[c for p in group for c in lift(p['colour'] or DEFAULT_COLOUR)])
+        rgba = bytearray(cell * cell * 4)
+        buf = (ctypes.c_char * len(rgba)).from_buffer(rgba)
+        r = lib.mp_render_rgba(len(group), counts, cols, data, cell, view, light, buf)
+        del buf
+        if r == -2:
+            raise MemoryError('mp_render_rgba')
+        return rgba if r == 0 else None
+
+    plates = sorted({p['plate'] for p in parts})
+    if len(plates) <= 1:
+        canvas = render_rgba(parts, size)
+        if canvas is None:
+            return False
+    else:
+        cols_n = math.ceil(math.sqrt(len(plates)))
+        rows_n = math.ceil(len(plates) / cols_n)
+        cell = size // cols_n
+        top = (size - rows_n * cell) // 2
+        canvas = bytearray(size * size * 4)
+        cs = max(16, cell - 4)
+        for i, pl in enumerate(plates):
+            im = render_rgba([p for p in parts if p['plate'] == pl], cs)
+            if im is None:
+                continue
+            x, y = i % cols_n * cell + 2, top + i // cols_n * cell + 2
+            for row in range(cs):      # cells don't overlap
+                o = ((y + row) * size + x) * 4
+                canvas[o:o + cs * 4] = im[row * cs * 4:(row + 1) * cs * 4]
+    raw = bytearray(size * (1 + 3 * size))
+    cbuf = (ctypes.c_char * len(canvas)).from_buffer(canvas)
+    rbuf = (ctypes.c_char * len(raw)).from_buffer(raw)
+    lib.mp_backdrop(cbuf, size, rbuf)
+    del cbuf, rbuf
+    write_png_rows(dst, raw, size, size)
+    return True
+
+
+def thumb_stl_native(data, size, dst):
+    """Binary STL -> PNG entirely in C plus zlib; False if the fast path doesn't apply."""
+    import ctypes
+    lib = native_lib()
+    if not lib:
+        return False
+    raw = bytearray(size * (1 + 3 * size))
+    buf = (ctypes.c_char * len(raw)).from_buffer(raw)
+    colour = (ctypes.c_uint8 * 3)(*lift(DEFAULT_COLOUR))
+    view, light = (ctypes.c_double * 3)(*VIEW_DIR), (ctypes.c_double * 3)(*LIGHT)
+    r = lib.mp_thumb_stl(data, len(data), colour, size, view, light, buf)
+    del buf
+    if r != 0:
+        return False
+    write_png_rows(dst, raw, size, size)
+    return True
 
 
 def write_png(path, rgb):
@@ -619,12 +782,19 @@ def main(argv):
     try:
         if ext == '.3mf':
             parts = load_3mf(src)
+            if parts and thumb_parts_native(parts, size, dst):
+                return
             im = render_plates(parts, size) if parts else None
         elif ext == '.scad':
-            im = render(load_scad(src, os.path.dirname(os.path.abspath(dst))), size)
+            data = scad_to_stl(src, os.path.dirname(os.path.abspath(dst)))
+            if thumb_stl_native(data, size, dst):
+                return
+            im = render(load_stl(data), size)
         else:
             with open(src, 'rb') as f:
                 data = f.read()
+            if ext == '.stl' and thumb_stl_native(data, size, dst):
+                return
             parts = load_obj(data) if ext == '.obj' else load_stl(data)
             im = render(parts, size) if parts else None
     except Exception as e:
