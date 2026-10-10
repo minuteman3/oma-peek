@@ -10,5 +10,6 @@
   ],
   "entryPoints": {
     "service": "Service.qml"
-  }
+  },
+  "license": "MIT"
 }

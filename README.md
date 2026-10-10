@@ -151,5 +151,7 @@ OMA_PEEK_DEBUG=1 /usr/lib/org.gnome.NautilusPreviewer   # previewer with logging
 - `docs/demo/make_demo.py OUT_DIR` generates the models used in these screenshots, from
   scratch, with OpenSCAD and OpenCASCADE.
 
-The viewer bundles [three.js](https://threejs.org) and [fflate](https://github.com/101arrowz/fflate)
-under the MIT licence (`web/vendor/LICENSE`).
+## License
+
+MIT, see [LICENSE](LICENSE). The viewer bundles [three.js](https://threejs.org) and
+[fflate](https://github.com/101arrowz/fflate), both also MIT (`web/vendor/LICENSE`).
