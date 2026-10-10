@@ -131,7 +131,8 @@ TRI_FAST = r'<triangle v1="(\d+)" v2="(\d+)" v3="(\d+)"'
 
 
 def iter_objects(data):
-    """Yield (attribute bytes, body bytes) per <object>, without regex-scanning huge meshes."""
+    """Yield (attribute bytes, body start, body end) per <object>. Offsets, not
+    slices: a mesh body can be ~100 MB and is parsed in place by mp_parse_mesh."""
     i = 0
     while True:
         s = data.find(b'<object', i)
@@ -145,28 +146,28 @@ def iter_objects(data):
             i = e + 1
             continue
         if head.endswith(b'/'):
-            yield head[:-1], b''
+            yield head[:-1], e + 1, e + 1
             i = e + 1
             continue
         c = data.find(b'</object>', e)
         if c < 0:
             c = len(data)
-        yield head, data[e + 1:c]
+        yield head, e + 1, c
         i = c + 9
 
 
 def parse_model(data):
     objects = {}
-    for head, body in iter_objects(data):
+    for head, b0, b1 in iter_objects(data):
         a = attrs(head.decode('utf-8', 'replace'))
         obj = dict(mesh=None, comps=[])
-        has_mesh = b'<mesh' in body
-        native = parse_mesh_native(body) if has_mesh else None
+        has_mesh = data.find(b'<mesh', b0, b1) >= 0      # found near the start when present
+        native = parse_mesh_native(data, b0, b1) if has_mesh else None
         if native is not None:
             if len(native[0]) and len(native[1]):
                 obj['mesh'] = native
         elif has_mesh:
-            text = body.decode('utf-8', 'replace')
+            text = data[b0:b1].decode('utf-8', 'replace')
             vs = re.findall(VERTEX_FAST, text)
             if not vs:
                 vs = [(re.search(r'\bx="([^"]*)"', s).group(1), re.search(r'\by="([^"]*)"', s).group(1),
@@ -176,7 +177,9 @@ def parse_model(data):
                 ts = [(re.search(r'\bv1="(\d+)"', s).group(1), re.search(r'\bv2="(\d+)"', s).group(1),
                        re.search(r'\bv3="(\d+)"', s).group(1)) for s in re.findall(r'<triangle\b([^>]*)>', text)]
             if vs and ts:
-                obj['mesh'] = (np.array(vs, dtype=np.float64), np.array(ts, dtype=np.int64))
+                obj['mesh'] = (np.array(vs, dtype=np.float32), np.array(ts, dtype=np.int64))
+        # A 3MF object holds a mesh or components, never both.
+        body = b'' if has_mesh else data[b0:b1]
         if b'<component' in body:
             for c in re.finditer(rb'<component\b([^>]*)/?>', body):
                 ca = attrs(c.group(1).decode('utf-8', 'replace'))
@@ -192,13 +195,44 @@ def parse_model(data):
     return objects, build
 
 
+def zip_member(f, info):
+    """Read one member's bytes without zipfile's streaming reader and CRC pass
+    (~60 ms on a 100 MB model): a thumbnail tolerates a corrupt archive."""
+    import struct
+    import zlib
+    f.seek(info.header_offset)
+    hdr = f.read(30)
+    if hdr[:4] != b'PK\x03\x04':
+        return None
+    name_len, extra_len = struct.unpack('<HH', hdr[26:30])
+    f.seek(info.header_offset + 30 + name_len + extra_len)
+    raw = f.read(info.compress_size)
+    if info.compress_type == zipfile.ZIP_STORED:
+        return raw
+    if info.compress_type == zipfile.ZIP_DEFLATED:
+        lib = native_lib()
+        if lib and info.file_size:
+            import ctypes
+            out = bytearray(info.file_size)
+            buf = (ctypes.c_char * len(out)).from_buffer(out)
+            if lib.mp_inflate(raw, len(raw), buf, len(out)) == len(out):
+                del buf
+                return out
+            del buf
+        return zlib.decompress(raw, -15, info.file_size or 65536)
+    return None
+
+
 def load_3mf(path):
     z = zipfile.ZipFile(path)
     names = {n.lower(): n for n in z.namelist()}
 
     def read(p):
         n = names.get(p.lstrip('/').lower())
-        return z.read(n) if n else None
+        if not n:
+            return None
+        data = zip_member(z.fp, z.getinfo(n))
+        return data if data is not None else z.read(n)
 
     root_path = '3D/3dmodel.model'
     rels = read('_rels/.rels')
@@ -279,9 +313,11 @@ def load_3mf(path):
             return
         if obj['mesh'] is not None:
             v, f = obj['mesh']
-            vh = np.c_[v, np.ones(len(v))] @ m
-            ok = (f < len(v)).all(axis=1)
-            out.append(vh[:, :3][f[ok]].astype(np.float32))
+            # float32 throughout: 3x3 + translation instead of float64 homogeneous coords.
+            vt = v @ m[:3, :3].astype(np.float32) + m[3, :3].astype(np.float32)
+            if f.size and f.max() >= len(v):
+                f = f[(f < len(v)).all(axis=1)]
+            out.append(np.take(vt, f, axis=0))
         for cid, cp, ct in obj['comps']:
             emit(out, cp or p, cid, ct @ m)
 
@@ -348,7 +384,9 @@ def native_lib():
     lib.mp_render.restype = ctypes.c_int
     lib.mp_render.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 3 + [ctypes.c_int] + [ctypes.c_void_p] * 4
     lib.mp_parse_mesh.restype = ctypes.c_int
-    lib.mp_parse_mesh.argtypes = [ctypes.c_char_p, ctypes.c_long] + [ctypes.c_void_p] * 4
+    lib.mp_parse_mesh.argtypes = [ctypes.c_void_p, ctypes.c_long] + [ctypes.c_void_p] * 4
+    lib.mp_inflate.restype = ctypes.c_long
+    lib.mp_inflate.argtypes = [ctypes.c_char_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_long]
     _lib[0] = lib
     return lib
 
@@ -358,18 +396,26 @@ def native_raster():
     return lib.mp_raster if lib else None
 
 
-def parse_mesh_native(body):
+def parse_mesh_native(data, b0, b1):
+    """Parse data[b0:b1] in place (no copy) with mp_parse_mesh."""
     import ctypes
     lib = native_lib()
     if not lib:
         return None
-    raw = body
+    if isinstance(data, bytearray):     # from mp_inflate
+        keep = (ctypes.c_char * len(data)).from_buffer(data)
+        base = ctypes.addressof(keep)
+    else:
+        keep = ctypes.c_char_p(data)    # points at the bytes object's own buffer
+        base = ctypes.cast(keep, ctypes.c_void_p).value
+    ptr, n = base + b0, b1 - b0
     nv, nt = ctypes.c_long(), ctypes.c_long()
-    lib.mp_parse_mesh(raw, len(raw), None, ctypes.byref(nv), None, ctypes.byref(nt))
+    lib.mp_parse_mesh(ptr, n, None, ctypes.byref(nv), None, ctypes.byref(nt))
     v = np.empty((nv.value, 3), dtype=np.float32)
     t = np.empty((nt.value, 3), dtype=np.int64)
-    lib.mp_parse_mesh(raw, len(raw), v.ctypes.data, ctypes.byref(nv), t.ctypes.data, ctypes.byref(nt))
-    return v.astype(np.float64), t
+    lib.mp_parse_mesh(ptr, n, v.ctypes.data, ctypes.byref(nv), t.ctypes.data, ctypes.byref(nt))
+    del keep
+    return v, t
 
 
 def raster_native(fn, px, py, sz, rgb, res):

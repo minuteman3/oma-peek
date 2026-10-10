@@ -413,6 +413,40 @@ int mp_render(int nparts, const int *counts, const uint8_t *colours, const float
     return drawn;
 }
 
+// --- inflate via libdeflate -------------------------------------------------------
+//
+// libdeflate decompresses whole buffers 2-3x faster than zlib. It is dlopen'd at
+// runtime so a system without it just gets -1 and the caller falls back to zlib.
+// Raw DEFLATE (as stored in zip members). Returns bytes written, or -1.
+
+#include <dlfcn.h>
+
+typedef void *(*deflate_alloc_fn)(void);
+typedef int (*deflate_decompress_fn)(void *, const void *, size_t, void *, size_t, size_t *);
+
+long mp_inflate(const void *src, long srclen, void *dst, long dstlen)
+{
+    static void *dec;
+    static deflate_decompress_fn decompress;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        void *h = dlopen("libdeflate.so.0", RTLD_NOW | RTLD_LOCAL);
+        if (h) {
+            deflate_alloc_fn alloc = (deflate_alloc_fn)dlsym(h, "libdeflate_alloc_decompressor");
+            decompress = (deflate_decompress_fn)dlsym(h, "libdeflate_deflate_decompress");
+            if (alloc && decompress)
+                dec = alloc();
+        }
+    }
+    if (!dec)
+        return -1;
+    size_t got = 0;
+    if (decompress(dec, src, (size_t)srclen, dst, (size_t)dstlen, &got) != 0)
+        return -1;
+    return (long)got;
+}
+
 // --- 3MF <mesh> parsing ---------------------------------------------------------
 //
 // Scans a mesh body for <vertex x= y= z=> and <triangle v1= v2= v3=> tags.
