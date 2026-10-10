@@ -41,10 +41,10 @@ which need their own handling.
 
 ## Install
 
-oma-peek is an Omarchy shell plugin. Install it with the repository URL:
+oma-peek is an Omarchy shell plugin:
 
 ```sh
-omarchy plugin add <repo-url> --enable
+omarchy plugin add https://github.com/minuteman3/oma-peek --enable
 nautilus -q   # once, so Nautilus picks up the new thumbnailer
 ```
 
