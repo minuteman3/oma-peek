@@ -49,7 +49,7 @@ nautilus -q   # once, so Nautilus picks up the new thumbnailer
 ```
 
 When the shell starts, the plugin builds and installs oma-peek if the code has changed, then
-sends a notification. `omarchy plugin update oma-peek` fetches new versions.
+sends a notification. `omarchy plugin update minuteman3.oma-peek` fetches new versions.
 
 Without the plugin system, clone the repository and run `./install.sh`.
 
@@ -95,7 +95,7 @@ rm -rf ~/.cache/thumbnails/{normal,large,x-large,xx-large}/*
 ## Uninstall
 
 ```sh
-omarchy plugin remove oma-peek
+omarchy plugin remove minuteman3.oma-peek
 ~/.local/share/oma-peek/uninstall.sh
 ```
 
