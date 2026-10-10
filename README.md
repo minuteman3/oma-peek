@@ -1,12 +1,36 @@
 # oma-peek
 
-Quick Look–style 3D previews for Nautilus on Omarchy (STL, 3MF, OBJ, SCAD, and through
-OpenCASCADE: STEP, IGES, glTF/GLB).
+Quick Look–style 3D previews for Nautilus on Omarchy: thumbnails and spacebar previews for
+STL, 3MF, OBJ, SCAD and, through OpenCASCADE, STEP, IGES and glTF/GLB.
+
+## Install (Omarchy plugin)
+
+```
+omarchy plugin add <git-url-of-this-repo> --enable     # or file:///path/to/a/checkout
+nautilus -q                                            # once, so Nautilus loads the thumbnailer
+```
+
+The plugin is a shell `service` (`Service.qml`): when the Omarchy shell starts it runs
+`install.sh --if-changed --notify`, which builds the native code and installs it if this
+checkout differs from what is installed, then sends a notification. `omarchy plugin update
+oma-peek` pulls new code; the next shell start installs it.
+
+Build needs `gcc`/`g++`, `python3`, `numpy` (fallback only), `sushi`, `webkit2gtk-4.1`, and
+optionally `opencascade` (STEP/IGES/glTF), `libdeflate` and `openscad`.
+
+Removing the plugin doesn't remove the installed previews; run
+`~/.local/share/oma-peek/uninstall.sh` (or `install.sh --uninstall`) for that.
+
+Installed files:
+- `~/.local/share/oma-peek/`: viewer page (`web/`), `oma-peek-cad`, `uninstall.sh`, install stamp
+- `~/.local/share/sushi/viewers/oma-peek.js`: Sushi viewer module
+- `~/.local/share/thumbnailers/oma-peek.thumbnailer`: thumbnailer (code embedded in its Exec line)
+- `~/.cache/oma-peek/`: converted SCAD/CAD meshes for the viewer
 
 ## Spacebar preview (Sushi plugin)
 
-- `~/.local/share/sushi/viewers/mesh.js`: Sushi viewer module. Sushi adds
-  `~/.local/share/sushi` to its import path, so no system files are touched.
+- `sushi/oma-peek.js` (installed to `~/.local/share/sushi/viewers/`): Sushi viewer module.
+  Sushi adds `~/.local/share/sushi` to its import path, so no system files are touched.
 - `web/`: three.js viewer page loaded into Sushi's WebKit view.
   - `loaders.js`: STL/OBJ/3MF parsing. 3MF reads build transforms, components, object names,
     filament colours (PrusaSlicer 3 project JSON, Slic3r_PE configs, Bambu/Orca project
@@ -16,8 +40,7 @@ OpenCASCADE: STEP, IGES, glTF/GLB).
   - Colours come from the current Omarchy theme (`~/.local/state/omarchy/current/theme/colors.toml`).
 - SCAD is rendered with `openscad` to `~/.cache/oma-peek/<sha1>.stl` (keyed on path + mtime).
 - Debug: `OMA_PEEK_DEBUG=1 /usr/lib/org.gnome.NautilusPreviewer` then `sushi FILE`.
-- After changing `mesh.js`, kill the running `org.gnome.NautilusPreviewer` process.
-  Edits to `web/` take effect on the next preview.
+- After editing `sushi/` or `web/`, run `./install.sh` (it restarts the previewer service).
 
 ## Thumbnails
 
