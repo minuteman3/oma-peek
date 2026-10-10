@@ -4,20 +4,38 @@ Usage: thumbnailer.py INPUT OUTPUT.png SIZE
 
 Runs inside the gnome-desktop thumbnailer sandbox, which only exposes /usr,
 the input file and the output directory, so this file must stay
-self-contained (stdlib + numpy + Pillow). install.sh embeds it into the
-.thumbnailer Exec line.
+self-contained (stdlib + numpy; Pillow only for the embedded-thumbnail
+fallback). install.sh embeds it into the .thumbnailer Exec line.
+
+Images are numpy RGBA arrays throughout and are written with a small zlib PNG
+encoder: importing Pillow costs ~50 ms of every thumbnail's startup.
 """
 
-import json
 import math
 import os
-import re
-import subprocess
 import sys
-import zipfile
 
 import numpy as np
-from PIL import Image
+
+
+class _Lazy:
+    """Import a module on first use: STL/OBJ thumbnails never need re, json,
+    zipfile or subprocess, and every import is paid per thumbnail process."""
+
+    def __init__(self, name):
+        self._name = name
+
+    def __getattr__(self, attr):
+        import importlib
+        mod = importlib.import_module(self._name)
+        globals()[self._name] = mod
+        return getattr(mod, attr)
+
+
+json = _Lazy('json')
+re = _Lazy('re')
+subprocess = _Lazy('subprocess')
+zipfile = _Lazy('zipfile')
 
 DEFAULT_COLOUR = (185, 192, 200)
 
@@ -59,11 +77,11 @@ def load_obj(data):
     return [dict(tris=v[np.array(faces)], colour=None, plate=0)]
 
 
-ATTR = re.compile(r'([\w:]+)\s*=\s*"([^"]*)"')
+ATTR = r'([\w:]+)\s*=\s*"([^"]*)"'
 
 
 def attrs(s):
-    return dict(ATTR.findall(s))
+    return dict(re.findall(ATTR, s))
 
 
 def transform(s):
@@ -108,8 +126,8 @@ def find_key(node, key):
     return None
 
 
-VERTEX_FAST = re.compile(r'<vertex x="([^"]+)" y="([^"]+)" z="([^"]+)"')
-TRI_FAST = re.compile(r'<triangle v1="(\d+)" v2="(\d+)" v3="(\d+)"')
+VERTEX_FAST = r'<vertex x="([^"]+)" y="([^"]+)" z="([^"]+)"'
+TRI_FAST = r'<triangle v1="(\d+)" v2="(\d+)" v3="(\d+)"'
 
 
 def iter_objects(data):
@@ -149,11 +167,11 @@ def parse_model(data):
                 obj['mesh'] = native
         elif has_mesh:
             text = body.decode('utf-8', 'replace')
-            vs = VERTEX_FAST.findall(text)
+            vs = re.findall(VERTEX_FAST, text)
             if not vs:
                 vs = [(re.search(r'\bx="([^"]*)"', s).group(1), re.search(r'\by="([^"]*)"', s).group(1),
                        re.search(r'\bz="([^"]*)"', s).group(1)) for s in re.findall(r'<vertex\b([^>]*)>', text)]
-            ts = TRI_FAST.findall(text)
+            ts = re.findall(TRI_FAST, text)
             if not ts:
                 ts = [(re.search(r'\bv1="(\d+)"', s).group(1), re.search(r'\bv2="(\d+)"', s).group(1),
                        re.search(r'\bv3="(\d+)"', s).group(1)) for s in re.findall(r'<triangle\b([^>]*)>', text)]
@@ -327,6 +345,8 @@ def native_lib():
         return None
     lib.mp_raster.restype = ctypes.c_int
     lib.mp_raster.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 4 + [ctypes.c_int, ctypes.c_int] + [ctypes.c_void_p] * 2
+    lib.mp_render.restype = ctypes.c_int
+    lib.mp_render.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 3 + [ctypes.c_int] + [ctypes.c_void_p] * 4
     lib.mp_parse_mesh.restype = ctypes.c_int
     lib.mp_parse_mesh.argtypes = [ctypes.c_char_p, ctypes.c_long] + [ctypes.c_void_p] * 4
     _lib[0] = lib
@@ -375,8 +395,31 @@ def lift(rgb):
     return tuple(min(255, int((c + k) * 255)) for c in (r, g, b))
 
 
+def render_native(lib, parts, size):
+    """Project, shade and rasterise in C (3x supersampled), then downsample."""
+    ss = 3
+    res = size * ss
+    tris = np.ascontiguousarray(np.concatenate([p['tris'] for p in parts]), dtype=np.float32)
+    counts = np.array([len(p['tris']) for p in parts], dtype=np.int32)
+    colours = np.array([lift(p['colour'] or DEFAULT_COLOUR) for p in parts], dtype=np.uint8)
+    view = np.ascontiguousarray(VIEW_DIR, dtype=np.float64)
+    light = np.ascontiguousarray(LIGHT, dtype=np.float64)
+    out = np.zeros((res, res, 4), dtype=np.uint8)
+    zbuf = np.full(res * res, -np.finfo(np.float32).max, dtype=np.float32)
+    r = lib.mp_render(len(parts), counts.ctypes.data, colours.ctypes.data, tris.ctypes.data, res,
+                      view.ctypes.data, light.ctypes.data, out.ctypes.data, zbuf.ctypes.data)
+    if r == -1:
+        return None
+    if r < 0:
+        raise MemoryError('mp_render')
+    return downsample(out, size)
+
+
 def render(parts, size):
     """Orthographic, z-buffered, flat-shaded render via barycentric point sampling."""
+    lib = native_lib()
+    if lib:
+        return render_native(lib, parts, size)
     tris = np.concatenate([p['tris'] for p in parts]).astype(np.float64)
     cols = np.concatenate([np.tile(np.array(lift(p['colour'] or DEFAULT_COLOUR), np.float64), (len(p['tris']), 1))
                            for p in parts])
@@ -455,15 +498,14 @@ def render(parts, size):
 
 
 def downsample(out, size):
-    im = Image.fromarray(out, 'RGBA')
-    # Premultiply before downsampling so edges don't pick up black fringes.
-    pre = np.array(im, dtype=np.float32)
+    """Premultiplied box filter from the supersampled render (res = size * k) to size."""
+    k = out.shape[0] // size
+    pre = out[:size * k, :size * k].astype(np.float32)
     pre[..., :3] *= pre[..., 3:] / 255
-    small = Image.fromarray(pre.astype(np.uint8), 'RGBA').resize((size, size), Image.LANCZOS)
-    arr = np.array(small, dtype=np.float32)
-    a = arr[..., 3:]
-    arr[..., :3] = np.where(a > 0, arr[..., :3] * 255 / np.maximum(a, 1), 0)
-    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), 'RGBA')
+    small = pre.reshape(size, k, size, k, 4).mean(axis=(1, 3))
+    a = small[..., 3:]
+    small[..., :3] = np.where(a > 0, small[..., :3] * 255 / np.maximum(a, 1), 0)
+    return np.clip(small + 0.5, 0, 255).astype(np.uint8)
 
 
 def render_plates(parts, size):
@@ -473,32 +515,52 @@ def render_plates(parts, size):
     cols = math.ceil(math.sqrt(len(plates)))
     rows = math.ceil(len(plates) / cols)
     cell = size // cols
-    canvas = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    canvas = np.zeros((size, size, 4), np.uint8)
     top = (size - rows * cell) // 2
     for i, pl in enumerate(plates):
         im = render([p for p in parts if p['plate'] == pl], max(16, cell - 4))
-        if im:
-            canvas.alpha_composite(im, (i % cols * cell + 2, top + i // cols * cell + 2))
+        if im is not None:
+            x, y = i % cols * cell + 2, top + i // cols * cell + 2
+            h, w = im.shape[:2]
+            canvas[y:y + h, x:x + w] = im      # cells don't overlap
     return canvas
 
 
 def with_background(im):
     """Nautilus draws a checkerboard behind transparent thumbnails; use a soft neutral backdrop."""
-    w, h = im.size
-    t = np.linspace(0, 1, h)[:, None, None]
-    top, bottom = np.array([58, 58, 62]), np.array([34, 34, 38])
-    bg = np.broadcast_to(top * (1 - t) + bottom * t, (h, w, 3)).astype(np.uint8)
-    canvas = Image.fromarray(np.dstack([bg, np.full((h, w), 255, np.uint8)]), 'RGBA')
-    canvas.alpha_composite(im)
-    return canvas.convert('RGB')
+    h, w = im.shape[:2]
+    t = np.linspace(0, 1, h, dtype=np.float32)[:, None, None]
+    top, bottom = np.array([58, 58, 62], np.float32), np.array([34, 34, 38], np.float32)
+    bg = top * (1 - t) + bottom * t
+    a = im[..., 3:].astype(np.float32) / 255
+    rgb = im[..., :3] * a + bg * (1 - a)
+    return np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
 
 
-def embedded_thumbnail(path):
+def write_png(path, rgb):
+    """Minimal 8-bit RGB PNG writer (zlib + struct)."""
+    import struct
+    import zlib
+    h, w = rgb.shape[:2]
+    raw = np.zeros((h, w * 3 + 1), np.uint8)          # filter byte 0 per row
+    raw[:, 1:] = rgb.reshape(h, w * 3)
+
+    def chunk(tag, data):
+        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data))
+    with open(path, 'wb') as f:
+        f.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                + chunk(b'IDAT', zlib.compress(raw.tobytes(), 6)) + chunk(b'IEND', b''))
+
+
+def embedded_thumbnail(path, size):
+    from PIL import Image
     with zipfile.ZipFile(path) as z:
         for n in z.namelist():
             if n.lower() in ('metadata/thumbnail.png', 'metadata/plate_1.png'):
                 import io
-                return Image.open(io.BytesIO(z.read(n))).convert('RGBA')
+                im = Image.open(io.BytesIO(z.read(n))).convert('RGBA')
+                im.thumbnail((size, size))
+                return np.asarray(im)
     return None
 
 
@@ -524,12 +586,10 @@ def main(argv):
         if ext != '.3mf':
             raise
     if im is None and ext == '.3mf':
-        im = embedded_thumbnail(src)
-        if im:
-            im.thumbnail((size, size))
+        im = embedded_thumbnail(src, size)
     if im is None:
         sys.exit(1)
-    with_background(im).save(dst, 'PNG')
+    write_png(dst, with_background(im))
 
 
 if __name__ == '__main__':

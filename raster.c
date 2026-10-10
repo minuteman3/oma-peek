@@ -310,6 +310,109 @@ int mp_raster(int n, const float *xs, const float *ys, const float *zs,
     return drawn;
 }
 
+// --- whole render: project + shade + raster ------------------------------------
+//
+// Replaces the numpy float64 pipeline in thumbnailer.py. Triangles are given in
+// world space (printer coords, Z up), grouped into parts with one base colour each.
+// Orthographic view along `view` (pointing at the camera); faces are double-sided.
+//
+//   nparts, counts[nparts]   triangles per part, in order
+//   colours[nparts * 3]      base RGB per part (already lifted for dark filament)
+//   tris[n * 9]              x,y,z of each triangle's three vertices
+//   res                      output is res x res; model fills 90% of it
+//   out, zbuf                as mp_raster (zeroed / -FLT_MAX by the caller)
+// Returns pixels drawn, or -1 if every triangle is degenerate.
+
+static void cross3(const double *a, const double *b, double *o)
+{
+    o[0] = a[1] * b[2] - a[2] * b[1];
+    o[1] = a[2] * b[0] - a[0] * b[2];
+    o[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+static void norm3(double *v)
+{
+    double l = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l > 0) { v[0] /= l; v[1] /= l; v[2] /= l; }
+}
+
+int mp_render(int nparts, const int *counts, const uint8_t *colours, const float *tris,
+              int res, const double *view, const double *light_dir, uint8_t *out, float *zbuf)
+{
+    long n = 0;
+    for (int k = 0; k < nparts; k++) n += counts[k];
+    double d[3] = {view[0], view[1], view[2]}, up0[3] = {0, 0, 1}, right[3], up[3];
+    double L[3] = {light_dir[0], light_dir[1], light_dir[2]};
+    norm3(d); norm3(L);
+    cross3(up0, d, right); norm3(right);
+    cross3(d, right, up);
+
+    float *xs = malloc(n * 3 * sizeof(float)), *ys = malloc(n * 3 * sizeof(float)), *zs = malloc(n * 3 * sizeof(float));
+    uint8_t *rgb = malloc(n * 3 + 1);
+    if (!xs || !ys || !zs || !rgb) {
+        free(xs); free(ys); free(zs); free(rgb);
+        return -2;
+    }
+
+    // Pass 1: shade and project to view space, dropping degenerate triangles.
+    long m = 0, t = 0;
+    double x0 = INFINITY, x1 = -INFINITY, y0 = INFINITY, y1 = -INFINITY;
+    for (int k = 0; k < nparts; k++) {
+        double cr = colours[k * 3], cg = colours[k * 3 + 1], cb = colours[k * 3 + 2];
+        for (int c = 0; c < counts[k]; c++, t++) {
+            const float *v = tris + t * 9;
+            double e1[3] = {v[3] - v[0], v[4] - v[1], v[5] - v[2]};
+            double e2[3] = {v[6] - v[0], v[7] - v[1], v[8] - v[2]};
+            double nn[3];
+            cross3(e1, e2, nn);
+            double nl = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+            if (!(nl > 0))
+                continue;
+            nn[0] /= nl; nn[1] /= nl; nn[2] /= nl;
+            double nd = nn[0] * d[0] + nn[1] * d[1] + nn[2] * d[2];
+            if (nd < 0) { nn[0] = -nn[0]; nn[1] = -nn[1]; nn[2] = -nn[2]; nd = -nd; }
+            double diffuse = nn[0] * L[0] + nn[1] * L[1] + nn[2] * L[2];
+            diffuse = diffuse < 0 ? 0 : diffuse > 1 ? 1 : diffuse;
+            double rim = nd > 1 ? 1 : nd;
+            double shade = 0.42 + 0.48 * diffuse + 0.12 * rim;
+            double sr = cr * shade, sg = cg * shade, sb = cb * shade;
+            rgb[m * 3] = (uint8_t)(sr > 255 ? 255 : sr);
+            rgb[m * 3 + 1] = (uint8_t)(sg > 255 ? 255 : sg);
+            rgb[m * 3 + 2] = (uint8_t)(sb > 255 ? 255 : sb);
+            for (int j = 0; j < 3; j++) {
+                double px = v[j * 3], py = v[j * 3 + 1], pz = v[j * 3 + 2];
+                double sx = px * right[0] + py * right[1] + pz * right[2];
+                double sy = px * up[0] + py * up[1] + pz * up[2];
+                xs[m * 3 + j] = (float)sx;
+                ys[m * 3 + j] = (float)sy;
+                zs[m * 3 + j] = (float)(px * d[0] + py * d[1] + pz * d[2]);
+                if (sx < x0) x0 = sx;
+                if (sx > x1) x1 = sx;
+                if (sy < y0) y0 = sy;
+                if (sy > y1) y1 = sy;
+            }
+            m++;
+        }
+    }
+    if (m == 0) {
+        free(xs); free(ys); free(zs); free(rgb);
+        return -1;
+    }
+
+    // Pass 2: fit to the image (90% of the larger extent, centred).
+    double span = fmax(x1 - x0, y1 - y0);
+    if (!(span > 0)) span = 1.0;
+    double scale = res * 0.9 / span, cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    for (long i = 0; i < m * 3; i++) {
+        xs[i] = (float)((xs[i] - cx) * scale + res / 2.0);
+        ys[i] = (float)(res / 2.0 - (ys[i] - cy) * scale);
+    }
+
+    int drawn = mp_raster((int)m, xs, ys, zs, rgb, res, res, out, zbuf);
+    free(xs); free(ys); free(zs); free(rgb);
+    return drawn;
+}
+
 // --- 3MF <mesh> parsing ---------------------------------------------------------
 //
 // Scans a mesh body for <vertex x= y= z=> and <triangle v1= v2= v3=> tags.
