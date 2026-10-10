@@ -331,32 +331,291 @@ static const char *attr(const char *p, const char *end, const char *name)
     return NULL;
 }
 
-int mp_parse_mesh(const char *buf, long len, float *verts, long *nverts,
-                  int64_t *tris, long *ntris)
+static const double POW10[] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+                               1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+
+// Plain decimal floats ("-12.345", "1e-3"); anything unusual falls back to strtof.
+static float parse_float_end(const char *s, const char **endp)
 {
-    const char *p = buf, *end = buf + len;
-    long nv = 0, nt = 0;
-    while ((p = memchr(p, '<', end - p)) != NULL) {
+    const char *p = s;
+    int neg = 0;
+    if (*p == '-') { neg = 1; p++; } else if (*p == '+') p++;
+    uint64_t m = 0;
+    int digits = 0, exp = 0;
+    while ((unsigned)(*p - '0') < 10) {
+        if (digits < 19) { m = m * 10 + (*p - '0'); digits++; } else exp++;
         p++;
+    }
+    if (*p == '.') {
+        p++;
+        while ((unsigned)(*p - '0') < 10) {
+            if (digits < 19) { m = m * 10 + (*p - '0'); digits++; exp--; }
+            p++;
+        }
+    }
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        int eneg = 0, e = 0;
+        if (*p == '-') { eneg = 1; p++; } else if (*p == '+') p++;
+        if ((unsigned)(*p - '0') >= 10)
+            return strtof(s, (char **)endp);
+        while ((unsigned)(*p - '0') < 10) { if (e < 10000) e = e * 10 + (*p - '0'); p++; }
+        exp += eneg ? -e : e;
+    }
+    if (digits == 0 || exp < -22 || exp > 22 || m > (1ULL << 53))
+        return strtof(s, (char **)endp);
+    *endp = p;
+    double v = exp < 0 ? (double)m / POW10[-exp] : (double)m * POW10[exp];
+    return (float)(neg ? -v : v);
+}
+
+static float parse_float(const char *s)
+{
+    const char *e;
+    return parse_float_end(s, &e);
+}
+
+// Fast path for the canonical layout ` x="…" y="…" z="…"` that every slicer writes.
+static int vertex_fast(const char *p, const char *end, float *v)
+{
+    static const char *names[3] = {" x=\"", " y=\"", " z=\""};
+    for (int k = 0; k < 3; k++) {
+        if (end - p < 6 || memcmp(p, names[k], 4) != 0)
+            return 0;
+        p += 4;
+        const char *e;
+        v[k] = parse_float_end(p, &e);
+        if (e == p || *e != '"')
+            return 0;
+        p = e + 1;
+    }
+    return 1;
+}
+
+static int triangle_fast(const char *p, const char *end, int64_t *t)
+{
+    static const char *names[3] = {" v1=\"", " v2=\"", " v3=\""};
+    for (int k = 0; k < 3; k++) {
+        if (end - p < 7 || memcmp(p, names[k], 5) != 0)
+            return 0;
+        p += 5;
+        int64_t v = 0;
+        const char *s = p;
+        while ((unsigned)(*p - '0') < 10) v = v * 10 + (*p++ - '0');
+        if (p == s || *p != '"')
+            return 0;
+        t[k] = v;
+        p++;
+    }
+    return 1;
+}
+
+static int64_t parse_int(const char *p)
+{
+    int64_t v = 0;
+    while ((unsigned)(*p - '0') < 10) v = v * 10 + (*p++ - '0');
+    return v;
+}
+
+// Output sink for scan_chunk: fixed caller arrays, growable owned arrays, or
+// count-only (v and t NULL, grow 0).
+typedef struct {
+    float *v;
+    int64_t *t;
+    long vcap, tcap;
+    int grow;
+} Sink;
+
+static int sink_room(Sink *o, long nv, long nt)
+{
+    if (!o->grow)
+        return 1;
+    if (nv >= o->vcap) {
+        long cap = o->vcap ? o->vcap * 2 : 4096;
+        float *v = realloc(o->v, cap * 3 * sizeof(float));
+        if (!v) return 0;
+        o->v = v; o->vcap = cap;
+    }
+    if (nt >= o->tcap) {
+        long cap = o->tcap ? o->tcap * 2 : 8192;
+        int64_t *t = realloc(o->t, cap * 3 * sizeof(int64_t));
+        if (!t) return 0;
+        o->t = t; o->tcap = cap;
+    }
+    return 1;
+}
+
+// Scan tags that start in [p, stop); a tag may run on past stop up to end.
+// Returns 0 if a growable sink ran out of memory.
+static int scan_chunk(const char *p, const char *stop, const char *end, Sink *o,
+                      long *nverts, long *ntris)
+{
+    long nv = 0, nt = 0;
+    while (p < stop && (p = memchr(p, '<', stop - p)) != NULL) {
+        p++;
+        if (!sink_room(o, nv, nt))
+            return 0;
+        float *verts = o->v;
+        int64_t *tris = o->t;
         if (end - p > 7 && memcmp(p, "vertex", 6) == 0 && (p[6] == ' ' || p[6] == '\t' || p[6] == '\n')) {
-            if (verts) {
+            float fv[3];
+            if (verts && vertex_fast(p + 6, end, fv)) {
+                verts[nv * 3] = fv[0]; verts[nv * 3 + 1] = fv[1]; verts[nv * 3 + 2] = fv[2];
+            } else if (verts) {
                 const char *x = attr(p + 6, end, "x"), *y = attr(p + 6, end, "y"), *z = attr(p + 6, end, "z");
-                verts[nv * 3] = x ? strtof(x, NULL) : 0;
-                verts[nv * 3 + 1] = y ? strtof(y, NULL) : 0;
-                verts[nv * 3 + 2] = z ? strtof(z, NULL) : 0;
+                verts[nv * 3] = x ? parse_float(x) : 0;
+                verts[nv * 3 + 1] = y ? parse_float(y) : 0;
+                verts[nv * 3 + 2] = z ? parse_float(z) : 0;
             }
             nv++;
         } else if (end - p > 9 && memcmp(p, "triangle", 8) == 0 && (p[8] == ' ' || p[8] == '\t' || p[8] == '\n')) {
+            int64_t ft[3];
+            if (triangle_fast(p + 8, end, ft)) {
+                if (tris) { tris[nt * 3] = ft[0]; tris[nt * 3 + 1] = ft[1]; tris[nt * 3 + 2] = ft[2]; }
+                nt++;
+                continue;
+            }
             const char *a = attr(p + 8, end, "v1"), *b = attr(p + 8, end, "v2"), *c = attr(p + 8, end, "v3");
             if (a && b && c) {
                 if (tris) {
-                    tris[nt * 3] = strtoll(a, NULL, 10);
-                    tris[nt * 3 + 1] = strtoll(b, NULL, 10);
-                    tris[nt * 3 + 2] = strtoll(c, NULL, 10);
+                    tris[nt * 3] = parse_int(a);
+                    tris[nt * 3 + 1] = parse_int(b);
+                    tris[nt * 3 + 2] = parse_int(c);
                 }
                 nt++;
             }
         }
+    }
+    *nverts = nv;
+    *ntris = nt;
+    return 1;
+}
+
+typedef struct {
+    const char *start, *stop, *end;
+    Sink sink;              // owned arrays filled during the counting call
+    int ok;
+    float *verts;           // destination slices in the caller's arrays
+    int64_t *tris;
+    long nv, nt;
+} Chunk;
+
+// Counting call: parse fully into owned buffers so the fill call is just a copy.
+static void *parse_chunk(void *arg)
+{
+    Chunk *c = arg;
+    c->sink = (Sink){NULL, NULL, 0, 0, 1};
+    c->ok = scan_chunk(c->start, c->stop, c->end, &c->sink, &c->nv, &c->nt);
+    return NULL;
+}
+
+static void *copy_chunk(void *arg)
+{
+    Chunk *c = arg;
+    if (c->verts) memcpy(c->verts, c->sink.v, c->nv * 3 * sizeof(float));
+    if (c->tris) memcpy(c->tris, c->sink.t, c->nt * 3 * sizeof(int64_t));
+    return NULL;
+}
+
+// Fallback when the owned buffers are unavailable: rescan straight into the caller's arrays.
+static void *fill_chunk(void *arg)
+{
+    Chunk *c = arg;
+    Sink o = {c->verts, c->tris, 0, 0, 0};
+    long nv, nt;
+    scan_chunk(c->start, c->stop, c->end, &o, &nv, &nt);
+    return NULL;
+}
+
+static void run_all(void *(*fn)(void *), Chunk *cs, int n)
+{
+    pthread_t tid[16];
+    int ok[16] = {0};
+    for (int k = 1; k < n; k++)
+        ok[k] = pthread_create(&tid[k], NULL, fn, &cs[k]) == 0;
+    fn(&cs[0]);
+    for (int k = 1; k < n; k++) {
+        if (ok[k])
+            pthread_join(tid[k], NULL);
+        else
+            fn(&cs[k]);
+    }
+}
+
+static void free_chunks(Chunk *cs, int n)
+{
+    for (int k = 0; k < n; k++) {
+        free(cs[k].sink.v);
+        free(cs[k].sink.t);
+        cs[k].sink.v = NULL;
+        cs[k].sink.t = NULL;
+    }
+}
+
+int mp_parse_mesh(const char *buf, long len, float *verts, long *nverts,
+                  int64_t *tris, long *ntris)
+{
+    const char *end = buf + len;
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    int n = len < (4L << 20) ? 1 : cpus < 1 ? 1 : cpus > 16 ? 16 : (int)cpus;
+
+    if (n == 1) {
+        Sink o = {verts, tris, 0, 0, 0};
+        scan_chunk(buf, end, end, &o, nverts, ntris);
+        return 0;
+    }
+
+    // Callers count first (NULL outputs), then fill the same buffer. The counting
+    // call parses everything into per-chunk buffers kept here; the fill call copies
+    // them out. Keyed on pointer, length and a sampled fingerprint.
+    static __thread struct { const char *buf; long len; uint64_t fp; int n; Chunk cs[16]; } memo;
+    uint64_t fp = 1469598103934665603ULL;   // FNV-1a over 64 sampled bytes
+    for (int i = 0; i < 64; i++)
+        fp = (fp ^ (uint8_t)buf[len / 64 * i]) * 1099511628211ULL;
+    int fill = verts || tris;
+    int cached = memo.buf == buf && memo.len == len && memo.fp == fp && memo.n == n;
+
+    if (!cached) {
+        if (memo.buf)
+            free_chunks(memo.cs, memo.n);
+        memo.buf = NULL;
+        // Chunk boundaries snap forward to a '<' so no tag is split between chunks.
+        Chunk *cs = memo.cs;
+        const char *prev = buf;
+        for (int k = 0; k < n; k++) {
+            const char *stop = end;
+            if (k < n - 1) {
+                stop = buf + len / n * (k + 1);
+                if (stop < prev) stop = prev;
+                const char *lt = memchr(stop, '<', end - stop);
+                stop = lt ? lt : end;
+            }
+            cs[k] = (Chunk){prev, stop, end};
+            prev = stop;
+        }
+        run_all(parse_chunk, cs, n);
+        for (int k = 0; k < n; k++)
+            if (!cs[k].ok) {    // out of memory: counts are partial, recount without storing
+                Sink none = {NULL, NULL, 0, 0, 0};
+                scan_chunk(cs[k].start, cs[k].stop, cs[k].end, &none, &cs[k].nv, &cs[k].nt);
+            }
+        memo.buf = buf; memo.len = len; memo.fp = fp; memo.n = n;
+    }
+
+    Chunk *cs = memo.cs;
+    int all_ok = 1;
+    long nv = 0, nt = 0;
+    for (int k = 0; k < n; k++) {
+        all_ok &= cs[k].ok;
+        cs[k].verts = verts ? verts + nv * 3 : NULL;
+        cs[k].tris = tris ? tris + nt * 3 : NULL;
+        nv += cs[k].nv;
+        nt += cs[k].nt;
+    }
+    if (fill) {
+        run_all(all_ok ? copy_chunk : fill_chunk, cs, n);
+        free_chunks(cs, n);     // one fill per count; the buffer may be freed after this
+        memo.buf = NULL;
     }
     *nverts = nv;
     *ntris = nt;
