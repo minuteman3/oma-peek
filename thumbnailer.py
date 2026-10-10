@@ -434,7 +434,7 @@ def load_3mf(path):
         if plates:
             plate = next((i for i, s in enumerate(plates) if f'{oid}#{k}' in s), 0)
         if all(isinstance(o, RawTris) for o in out):
-            tris = RawTris(b''.join(o.data for o in out), sum(o.n for o in out))
+            tris = RawTris([c for o in out for c in o.chunks])     # no copies
         else:
             tris = np.concatenate([o.array() if isinstance(o, RawTris) else o for o in out])
         parts.append(dict(tris=tris, colour=colour, plate=plate))
@@ -494,9 +494,11 @@ def native_lib():
         lib.mp_downsample.restype = None
         lib.mp_downsample.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
         lib.mp_thumb_stl.restype = ctypes.c_int
-        lib.mp_thumb_stl.argtypes = [ctypes.c_char_p, ctypes.c_long] + [ctypes.c_void_p] * 1 + [ctypes.c_int] + [ctypes.c_void_p] * 3
+        lib.mp_thumb_stl.argtypes = [ctypes.c_void_p, ctypes.c_long] + [ctypes.c_void_p] * 1 + [ctypes.c_int] + [ctypes.c_void_p] * 3
         lib.mp_render_rgba.restype = ctypes.c_int
-        lib.mp_render_rgba.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 2 + [ctypes.c_char_p, ctypes.c_int] + [ctypes.c_void_p] * 3
+        lib.mp_render_rgba.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 3 + [ctypes.c_int] + [ctypes.c_void_p] * 3
+        lib.mp_render_rgba_parts.restype = ctypes.c_int
+        lib.mp_render_rgba_parts.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 3 + [ctypes.c_int] + [ctypes.c_void_p] * 3
         lib.mp_backdrop.restype = None
         lib.mp_backdrop.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
         lib.mp_emit.restype = ctypes.c_long
@@ -526,17 +528,20 @@ class RawMesh:
 
 
 class RawTris:
-    """n triangles as packed float32 (9 per triangle) in a bytes-like object."""
-    __slots__ = ('data', 'n')
+    """Triangles as packed float32 (9 per triangle), kept as separate chunks
+    (one per mesh) so nothing is ever concatenated on the native path."""
+    __slots__ = ('chunks', 'n')
 
-    def __init__(self, data, n):
-        self.data, self.n = data, n
+    def __init__(self, chunks):
+        self.chunks = [(buf, n) for buf, n in chunks if n]   # (bytes-like, triangle count)
+        self.n = sum(n for _, n in self.chunks)
 
     def __len__(self):
         return self.n
 
     def array(self):
-        return np.frombuffer(self.data, np.float32).reshape(-1, 3, 3)
+        arrays = [np.frombuffer(buf, np.float32, n * 9).reshape(-1, 3, 3) for buf, n in self.chunks]
+        return np.concatenate(arrays) if len(arrays) != 1 else arrays[0]
 
 
 def emit_native(mesh, m):
@@ -548,9 +553,7 @@ def emit_native(mesh, m):
     ob = (ctypes.c_char * len(out)).from_buffer(out)
     w = lib.mp_emit(vb, mesh.nv, tb, mesh.nt, (ctypes.c_double * 12)(*m), ob)
     del vb, tb, ob
-    if w < mesh.nt:
-        del out[w * 36:]
-    return RawTris(out, w)
+    return RawTris([(out, w)])
 
 
 def parse_mesh_native(data, b0, b1):
@@ -770,13 +773,21 @@ def thumb_parts_native(parts, size, dst):
     view, light = (ctypes.c_double * 3)(*VIEW_DIR), (ctypes.c_double * 3)(*LIGHT)
 
     def render_rgba(group, cell):
-        data = group[0]['tris'].data if len(group) == 1 else b''.join(p['tris'].data for p in group)
-        counts = (ctypes.c_int * len(group))(*[p['tris'].n for p in group])
-        cols = (ctypes.c_uint8 * (3 * len(group)))(*[c for p in group for c in lift(p['colour'] or DEFAULT_COLOUR)])
+        # Every mesh chunk is its own part to C, carrying its object's colour: no joins.
+        chunks = [(buf, n, lift(p['colour'] or DEFAULT_COLOUR)) for p in group for buf, n in p['tris'].chunks]
+        if not chunks:
+            return None
+        views = [(ctypes.c_char * len(buf)).from_buffer(buf) if isinstance(buf, bytearray) else buf
+                 for buf, _, _ in chunks]
+        ptrs = (ctypes.c_void_p * len(chunks))(*[ctypes.addressof(v) if not isinstance(v, bytes)
+                                                 else ctypes.cast(ctypes.c_char_p(v), ctypes.c_void_p).value
+                                                 for v in views])
+        counts = (ctypes.c_int * len(chunks))(*[n for _, n, _ in chunks])
+        cols = (ctypes.c_uint8 * (3 * len(chunks)))(*[c for _, _, col in chunks for c in col])
         rgba = bytearray(cell * cell * 4)
         buf = (ctypes.c_char * len(rgba)).from_buffer(rgba)
-        r = lib.mp_render_rgba(len(group), counts, cols, data, cell, view, light, buf)
-        del buf
+        r = lib.mp_render_rgba_parts(len(chunks), counts, cols, ptrs, cell, view, light, buf)
+        del buf, views
         if r == -2:
             raise MemoryError('mp_render_rgba')
         return rgba if r == 0 else None
@@ -808,6 +819,25 @@ def thumb_parts_native(parts, size, dst):
     del cbuf, rbuf
     write_png_rows(dst, raw, size, size)
     return True
+
+
+def thumb_stl_mapped(path, size, dst):
+    """Binary STL fast path on a copy-on-write mapping: no 50 MB read into a bytes object."""
+    import ctypes
+    import mmap
+    try:
+        with open(path, 'rb') as f:
+            m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY)
+    except (OSError, ValueError):
+        return False
+    try:
+        buf = (ctypes.c_char * len(m)).from_buffer(m)
+        try:
+            return thumb_stl_native(buf, size, dst)
+        finally:
+            del buf
+    finally:
+        m.close()
 
 
 def thumb_stl_native(data, size, dst):
@@ -873,10 +903,10 @@ def main(argv):
                 return
             im = render(load_stl(data), size)
         else:
+            if ext == '.stl' and thumb_stl_mapped(src, size, dst):
+                return
             with open(src, 'rb') as f:
                 data = f.read()
-            if ext == '.stl' and thumb_stl_native(data, size, dst):
-                return
             parts = load_obj(data) if ext == '.obj' else load_stl(data)
             im = render(parts, size) if parts else None
     except Exception as e:

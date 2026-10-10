@@ -342,7 +342,8 @@ static void norm3(double *v)
 typedef struct {
     const int *counts;
     const uint8_t *colours;
-    const float *tris;
+    const uint8_t *const *ptrs;     // per part: first triangle's 9 floats (may be unaligned)
+    long stride;                    // bytes between triangles (36 packed, 50 in binary STL)
     int nparts;
     long lo, hi;                    // triangle range for this worker
     const double *d, *L, *right, *up;
@@ -365,7 +366,8 @@ static void *shade_range(void *arg)
     pend += J->counts[k];
     for (long t = J->lo; t < J->hi; t++) {
         while (t >= pend && k < J->nparts - 1) pend += J->counts[++k];
-        const float *v = J->tris + t * 9;
+        float v[9];
+        memcpy(v, J->ptrs[k] + (t - (pend - J->counts[k])) * J->stride, sizeof v);
         double e1[3] = {v[3] - v[0], v[4] - v[1], v[5] - v[2]};
         double e2[3] = {v[6] - v[0], v[7] - v[1], v[8] - v[2]};
         double nn[3];
@@ -423,8 +425,9 @@ static void *fit_range(void *arg)
     return NULL;
 }
 
-int mp_render(int nparts, const int *counts, const uint8_t *colours, const float *tris,
-              int res, const double *view, const double *light_dir, uint8_t *out, float *zbuf)
+static int render_strided(int nparts, const int *counts, const uint8_t *colours,
+                          const uint8_t *const *ptrs, long stride, int res, const double *view,
+                          const double *light_dir, uint8_t *out, float *zbuf)
 {
     long n = 0;
     for (int k = 0; k < nparts; k++) n += counts[k];
@@ -448,7 +451,7 @@ int mp_render(int nparts, const int *counts, const uint8_t *colours, const float
     // Pass 1 (parallel): shade and project to view space.
     ShadeJob jobs[MAXT];
     for (int j = 0; j < nt; j++)
-        jobs[j] = (ShadeJob){counts, colours, tris, nparts, n * j / nt, n * (j + 1) / nt,
+        jobs[j] = (ShadeJob){counts, colours, ptrs, stride, nparts, n * j / nt, n * (j + 1) / nt,
                              d, L, right, up, xs, ys, zs, rgb};
     run_threads(shade_range, jobs, sizeof(ShadeJob), nt);
     double x0 = INFINITY, x1 = -INFINITY, y0 = INFINITY, y1 = -INFINITY;
@@ -477,6 +480,23 @@ int mp_render(int nparts, const int *counts, const uint8_t *colours, const float
     int drawn = mp_raster((int)n, xs, ys, zs, rgb, res, res, out, zbuf);
     free(xs); free(ys); free(zs); free(rgb);
     return drawn;
+}
+
+int mp_render(int nparts, const int *counts, const uint8_t *colours, const float *tris,
+              int res, const double *view, const double *light_dir, uint8_t *out, float *zbuf)
+{
+    // One packed buffer: part k starts after the triangles of parts 0..k-1.
+    const uint8_t **ptrs = malloc(sizeof *ptrs * (nparts > 0 ? nparts : 1));
+    if (!ptrs)
+        return -2;
+    long off = 0;
+    for (int k = 0; k < nparts; k++) {
+        ptrs[k] = (const uint8_t *)tris + off * 36;
+        off += counts[k];
+    }
+    int r = render_strided(nparts, counts, colours, ptrs, 36, res, view, light_dir, out, zbuf);
+    free(ptrs);
+    return r;
 }
 
 // --- downsample ----------------------------------------------------------------
@@ -543,8 +563,9 @@ static void backdrop_rows(const uint8_t *im, int size, uint8_t *raw)
 
 // Render + downsample to a size x size RGBA image (transparent background).
 // Returns 0, -1 if every triangle is degenerate, -2 on allocation failure.
-int mp_render_rgba(int nparts, const int *counts, const uint8_t *colours, const float *tris,
-                   int size, const double *view, const double *light, uint8_t *rgba)
+static int render_rgba_strided(int nparts, const int *counts, const uint8_t *colours,
+                               const uint8_t *const *ptrs, long stride, int size, const double *view,
+                               const double *light, uint8_t *rgba)
 {
     int k = 3, res = size * k;
     uint8_t *out = calloc((size_t)res * res, 4);
@@ -554,13 +575,39 @@ int mp_render_rgba(int nparts, const int *counts, const uint8_t *colours, const 
         return -2;
     }
     for (long i = 0; i < (long)res * res; i++) zbuf[i] = -FLT_MAX;
-    int r = mp_render(nparts, counts, colours, tris, res, view, light, out, zbuf);
+    int r = render_strided(nparts, counts, colours, ptrs, stride, res, view, light, out, zbuf);
     if (r >= 0) {
         mp_downsample(out, size, k, rgba);
         r = 0;
     }
     free(out); free(zbuf);
     return r;
+}
+
+int mp_render_rgba(int nparts, const int *counts, const uint8_t *colours, const float *tris,
+                   int size, const double *view, const double *light, uint8_t *rgba)
+{
+    const uint8_t **ptrs = malloc(sizeof *ptrs * (nparts > 0 ? nparts : 1));
+    if (!ptrs)
+        return -2;
+    long off = 0;
+    for (int k = 0; k < nparts; k++) {
+        ptrs[k] = (const uint8_t *)tris + off * 36;
+        off += counts[k];
+    }
+    int r = render_rgba_strided(nparts, counts, colours, ptrs, 36, size, view, light, rgba);
+    free(ptrs);
+    return r;
+}
+
+// As mp_render_rgba, but each part's packed triangles live in their own buffer,
+// so callers never have to concatenate meshes.
+int mp_render_rgba_parts(int nparts, const int *counts, const uint8_t *colours,
+                         const void *const *ptrs, int size, const double *view,
+                         const double *light, uint8_t *rgba)
+{
+    return render_rgba_strided(nparts, counts, colours, (const uint8_t *const *)ptrs, 36,
+                               size, view, light, rgba);
 }
 
 void mp_backdrop(const uint8_t *rgba, int size, uint8_t *raw)
@@ -614,16 +661,18 @@ int mp_thumb_stl(const uint8_t *data, long len, const uint8_t *colour, int size,
         return -3;
     uint32_t n;
     memcpy(&n, data + 80, 4);
-    if (n == 0 || (long)n * 50 + 84 != len)
+    if (n == 0 || n > INT32_MAX || (long)n * 50 + 84 != len)
         return -3;
-    float *tris = malloc((size_t)n * 36);
-    if (!tris)
+    // Render straight from the 50-byte records (normal, 3 vertices, attribute).
+    uint8_t *small = malloc((size_t)size * size * 4);
+    if (!small)
         return -2;
-    for (uint32_t i = 0; i < n; i++)
-        memcpy(tris + (size_t)i * 9, data + 84 + (size_t)i * 50 + 12, 36);
     int count = (int)n;
-    int r = mp_thumb(1, &count, colour, tris, size, view, light, raw);
-    free(tris);
+    const uint8_t *first = data + 84 + 12;
+    int r = render_rgba_strided(1, &count, colour, &first, 50, size, view, light, small);
+    if (r == 0)
+        backdrop_rows(small, size, raw);
+    free(small);
     return r;
 }
 
