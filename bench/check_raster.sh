@@ -29,7 +29,7 @@ sys.exit(0 if ok else 1)
 PY
 # End-to-end: thumbnailer with this library.
 gcc $(cat cflags) -shared -s -o libmeshraster.so raster.c -lm -lpthread
-python3 -I thumbnailer.py ~/Downloads/frame_set_black1.3mf "$out/a.png" 256
-python3 -I thumbnailer.py ~/Downloads/stand_V3.stl "$out/b.png" 128
+python3 -I thumbnailer.py bench/e2e/data/typical.3mf "$out/a.png" 256
+python3 -I thumbnailer.py bench/e2e/data/small.stl "$out/b.png" 128
 python3 -I -c "from PIL import Image; import sys; [Image.open(p).verify() for p in sys.argv[1:]]" "$out/a.png" "$out/b.png"
 echo checks ok
