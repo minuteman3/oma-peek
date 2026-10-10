@@ -40,6 +40,11 @@ DEFAULT_COLOUR = (185, 192, 200)
 
 # Compressed libmeshraster.so (base64 of zlib), filled in by install.sh.
 _NATIVE_SO = None
+# Compressed libmeshcad.so (OpenCASCADE readers), loaded only for CAD formats.
+_NATIVE_CAD_SO = None
+
+# Formats read through libmeshcad (OpenCASCADE): extension -> mp_cad_load format id.
+CAD_FORMATS = {'.step': 1, '.stp': 1, '.iges': 2, '.igs': 2, '.gltf': 3, '.glb': 3, '.obj': 4}
 VIEW_DIR = (0.75, -1.05, 0.62)   # printer coords, Z up: front-right, above
 LIGHT = (0.35, -0.55, 0.9)
 
@@ -462,6 +467,61 @@ def scad_to_stl(path, workdir):
 
 # --- software renderer ---------------------------------------------------------
 
+_cad_lib = []
+
+
+def cad_lib():
+    """libmeshcad (OpenCASCADE readers), loaded from memory only when a CAD file is seen."""
+    if _cad_lib:
+        return _cad_lib[0]
+    import ctypes
+    _cad_lib.append(None)
+    try:
+        if _NATIVE_CAD_SO:
+            import base64
+            import zlib
+            fd = os.memfd_create('meshcad', 0)
+            os.write(fd, zlib.decompress(base64.b64decode(_NATIVE_CAD_SO)))
+            lib = ctypes.CDLL(f'/proc/self/fd/{fd}')
+        else:
+            here = os.path.dirname(os.path.abspath(globals().get('__file__', '')))
+            lib = ctypes.CDLL(os.path.join(here, 'libmeshcad.so'))
+        lib.mp_cad_load.restype = ctypes.c_void_p
+        lib.mp_cad_load.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        lib.mp_cad_nparts.restype = ctypes.c_int
+        lib.mp_cad_nparts.argtypes = [ctypes.c_void_p]
+        lib.mp_cad_part.restype = ctypes.c_long
+        lib.mp_cad_part.argtypes = [ctypes.c_void_p, ctypes.c_int] + [ctypes.c_void_p] * 4
+        lib.mp_cad_free.restype = None
+        lib.mp_cad_free.argtypes = [ctypes.c_void_p]
+    except (OSError, AttributeError, ValueError) as e:
+        print(f'oma-peek: CAD reader unavailable ({e})', file=sys.stderr)
+        return None
+    _cad_lib[0] = lib
+    return lib
+
+
+def thumb_cad(path, fmt, size, dst):
+    """STEP/IGES/glTF/OBJ -> PNG: parts from OpenCASCADE, rendered by the usual C path."""
+    import ctypes
+    lib = cad_lib()
+    if not lib:
+        return False
+    h = lib.mp_cad_load(os.fsencode(path), fmt, 0)
+    if not h:
+        return False
+    try:
+        parts = []
+        for i in range(lib.mp_cad_nparts(h)):
+            ptr, rgb, has, name = ctypes.c_void_p(), (ctypes.c_uint8 * 3)(), ctypes.c_int(), ctypes.c_char_p()
+            n = lib.mp_cad_part(h, i, ctypes.byref(ptr), rgb, ctypes.byref(has), ctypes.byref(name))
+            if n > 0:
+                parts.append(dict(tris=RawTris([(ptr.value, n)]), colour=tuple(rgb) if has.value else None, plate=0))
+        return bool(parts) and thumb_parts_native(parts, size, dst)
+    finally:
+        lib.mp_cad_free(h)
+
+
 _lib = []
 
 
@@ -540,7 +600,9 @@ class RawTris:
         return self.n
 
     def array(self):
-        arrays = [np.frombuffer(buf, np.float32, n * 9).reshape(-1, 3, 3) for buf, n in self.chunks]
+        import ctypes
+        arrays = [np.frombuffer((ctypes.c_float * (n * 9)).from_address(buf) if isinstance(buf, int) else buf,
+                                np.float32, n * 9).reshape(-1, 3, 3) for buf, n in self.chunks]
         return np.concatenate(arrays) if len(arrays) != 1 else arrays[0]
 
 
@@ -777,10 +839,12 @@ def thumb_parts_native(parts, size, dst):
         chunks = [(buf, n, lift(p['colour'] or DEFAULT_COLOUR)) for p in group for buf, n in p['tris'].chunks]
         if not chunks:
             return None
+        # Chunk buffers: bytearray (from mp_emit), bytes, or an int address owned by C (libmeshcad).
         views = [(ctypes.c_char * len(buf)).from_buffer(buf) if isinstance(buf, bytearray) else buf
                  for buf, _, _ in chunks]
-        ptrs = (ctypes.c_void_p * len(chunks))(*[ctypes.addressof(v) if not isinstance(v, bytes)
+        ptrs = (ctypes.c_void_p * len(chunks))(*[v if isinstance(v, int)
                                                  else ctypes.cast(ctypes.c_char_p(v), ctypes.c_void_p).value
+                                                 if isinstance(v, bytes) else ctypes.addressof(v)
                                                  for v in views])
         counts = (ctypes.c_int * len(chunks))(*[n for _, n, _ in chunks])
         cols = (ctypes.c_uint8 * (3 * len(chunks)))(*[c for _, _, col in chunks for c in col])
@@ -902,6 +966,14 @@ def main(argv):
             if thumb_stl_native(data, size, dst):
                 return
             im = render(load_stl(data), size)
+        elif ext in CAD_FORMATS:
+            if thumb_cad(src, CAD_FORMATS[ext], size, dst):
+                return
+            if ext != '.obj':
+                sys.exit(1)     # unreadable CAD file: Nautilus keeps the generic icon
+            with open(src, 'rb') as f:
+                parts = load_obj(f.read())      # OBJ fallback without OpenCASCADE
+            im = render(parts, size) if parts else None
         else:
             if ext == '.stl' and thumb_stl_mapped(src, size, dst):
                 return

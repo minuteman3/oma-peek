@@ -5,3 +5,5 @@ bench/bench
 bench/ref/
 bench/e2e/data/
 bench/e2e/ref/
+libmeshcad.so
+oma-peek-cad

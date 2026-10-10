@@ -13,7 +13,8 @@ data = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 os.makedirs(out_dir, exist_ok=True)
 
 # Thumbnail sizes Nautilus requests: 256 (large) is the default grid view.
-cases = [(f, 256) for f in sorted(os.listdir(data))] + [('big.3mf', 512), ('typical.stl', 512)]
+# .mtl files are OBJ side files, not test cases.
+cases = [(f, 256) for f in sorted(os.listdir(data)) if not f.endswith('.mtl')] + [('big.3mf', 512), ('typical.stl', 512)]
 total = big = small = 0.0
 for name, size in cases:
     best = float('inf')

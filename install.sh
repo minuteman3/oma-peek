@@ -17,12 +17,29 @@ out_dir="${XDG_DATA_HOME:-$HOME/.local/share}/thumbnailers"
 mkdir -p "$out_dir"
 
 gcc $(cat "$here/cflags") -shared -s -o "$here/libmeshraster.so" "$here/raster.c" $(cat "$here/ldlibs")
+# OpenCASCADE-backed readers (STEP/IGES/glTF/OBJ): a library for the thumbnailer and a
+# converter for the Sushi viewer. Skipped (with a warning) if OpenCASCADE isn't installed.
+cad_ok=0
+if [ -f /usr/include/opencascade/STEPCAFControl_Reader.hxx ]; then
+    g++ -O2 -std=c++17 -fPIC -shared -s -I/usr/include/opencascade \
+        -o "$here/libmeshcad.so" "$here/cad.cpp" $(cat "$here/cad_ldlibs")
+    g++ -O2 -std=c++17 -s -DOMA_PEEK_CAD_MAIN -I/usr/include/opencascade \
+        -o "$here/oma-peek-cad" "$here/cad.cpp" $(cat "$here/cad_ldlibs")
+    cad_ok=1
+else
+    echo "warning: OpenCASCADE headers not found; STEP/IGES/glTF previews disabled" >&2
+    rm -f "$here/libmeshcad.so" "$here/oma-peek-cad"
+fi
 
 python3 -I - "$here" "$out_dir/oma-peek.thumbnailer" "${payload_file:-}" <<'EOF'
 import base64, sys, zlib
 here, dest, payload_file = sys.argv[1], sys.argv[2], sys.argv[3]
-so = base64.b64encode(zlib.compress(open(f'{here}/libmeshraster.so', 'rb').read(), 9)).decode()
-src = open(f'{here}/thumbnailer.py').read().replace('_NATIVE_SO = None', f'_NATIVE_SO = {so!r}', 1)
+import os
+def embed(lib):
+    return base64.b64encode(zlib.compress(open(f'{here}/{lib}', 'rb').read(), 9)).decode()
+src = open(f'{here}/thumbnailer.py').read().replace('_NATIVE_SO = None', f'_NATIVE_SO = {embed("libmeshraster.so")!r}', 1)
+if os.path.exists(f'{here}/libmeshcad.so'):
+    src = src.replace('_NATIVE_CAD_SO = None', f'_NATIVE_CAD_SO = {embed("libmeshcad.so")!r}', 1)
 payload = base64.b64encode(zlib.compress(src.encode(), 9)).decode()
 code = f"import base64,zlib;exec(zlib.decompress(base64.b64decode('{payload}')))"
 if len(code) > 120_000:
@@ -33,6 +50,8 @@ if payload_file:
 mimes = ['model/stl', 'model/x.stl-ascii', 'model/x.stl-binary', 'application/sla',
          'model/3mf', 'application/vnd.ms-package.3dmanufacturing-3dmodel+xml',
          'model/obj', 'application/x-openscad']
+if os.path.exists(f'{here}/libmeshcad.so'):
+    mimes += ['model/step', 'model/iges', 'model/gltf+json', 'model/gltf-binary']
 open(dest, 'w').write(
     '[Thumbnailer Entry]\n'
     'TryExec=/usr/bin/python3\n'

@@ -499,8 +499,40 @@ function load3MF(bytes) {
     return { yUp: false, plates: plateList, parts };
 }
 
+// --- MPK (oma-peek-cad output for STEP/IGES/glTF) ------------------------------
+//
+// "MPK1", u32 JSON length, JSON {parts:[{name, color, n}]}, then each part's
+// float32 triangles (9 per triangle), Z-up millimetres.
+
+function loadMPK(bytes) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (new TextDecoder().decode(bytes.subarray(0, 4)) !== 'MPK1')
+        throw new Error('not an MPK file');
+    const len = dv.getUint32(4, true);
+    const head = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + len)));
+    let off = 8 + len;
+    const parts = head.parts.map((p) => {
+        const count = p.n * 9;
+        // slice() copies into an aligned buffer whatever the source alignment.
+        const positions = new Float32Array(bytes.buffer.slice(bytes.byteOffset + off, bytes.byteOffset + off + count * 4));
+        off += count * 4;
+        const indices = new Uint32Array(p.n * 3);
+        for (let i = 0; i < indices.length; i++) indices[i] = i;
+        return { name: p.name || null, plate: 0, positions, indices, triColors: null, color: normColor(p.color) };
+    });
+    const seen = new Map();
+    for (const p of parts) {
+        if (!p.name) continue;
+        const n = (seen.get(p.name) || 0) + 1;
+        seen.set(p.name, n);
+        if (n > 1) p.name = `${p.name} (${n})`;
+    }
+    return { yUp: false, plates: [{ name: 'Model' }], parts };
+}
+
 export async function loadModel(bytes, ext, fetchSibling) {
     ext = ext.toLowerCase();
+    if (ext === 'mpk') return loadMPK(bytes);
     if (ext === '3mf') return load3MF(bytes);
     if (ext === 'obj') return loadOBJ(bytes, fetchSibling);
     return loadSTL(bytes);
