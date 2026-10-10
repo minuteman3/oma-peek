@@ -68,17 +68,42 @@ int mp_raster(int n, const float *xs, const float *ys, const float *zs,
             continue;
         }
 
-        for (int py = miny; py <= maxy; py++) {
-            float cy = py + 0.5f;
-            for (int px = minx; px <= maxx; px++) {
-                float cx = px + 0.5f;
-                float w0 = edge(x1, y1, x2, y2, cx, cy);
-                float w1 = edge(x2, y2, x0, y0, cx, cy);
-                float w2 = edge(x0, y0, x1, y1, cx, cy);
-                if (w0 < 0 || w1 < 0 || w2 < 0)
-                    continue;
-                float z = (w0 * z0 + w1 * z1 + w2 * z2) * inv;
-                long i = (long)py * w + px;
+        // Edge functions are affine in (x, y): step them instead of re-evaluating.
+        float a0 = -(y2 - y1), b0 = x2 - x1;
+        float a1 = -(y0 - y2), b1 = x0 - x2;
+        float a2 = -(y1 - y0), b2 = x1 - x0;
+        float sx = minx + 0.5f, sy = miny + 0.5f;
+        float r0 = edge(x1, y1, x2, y2, sx, sy);
+        float r1 = edge(x2, y2, x0, y0, sx, sy);
+        float r2 = edge(x0, y0, x1, y1, sx, sy);
+        // z is affine too: z(t) = zr + dzx * t along a row.
+        float dzx = (a0 * z0 + a1 * z1 + a2 * z2) * inv;
+        float dzy = (b0 * z0 + b1 * z1 + b2 * z2) * inv;
+        float zr = (r0 * z0 + r1 * z1 + r2 * z2) * inv;
+        int span = maxx - minx;
+        for (int py = miny; py <= maxy; py++, r0 += b0, r1 += b1, r2 += b2, zr += dzy) {
+            // Solve r + a*t >= 0 per edge for the covered t-range on this row.
+            float lo = 0, hi = (float)span;
+            float rs[3] = {r0, r1, r2}, as[3] = {a0, a1, a2};
+            for (int k = 0; k < 3; k++) {
+                if (as[k] > 0) {
+                    float t = -rs[k] / as[k];
+                    if (t > lo) lo = t;
+                } else if (as[k] < 0) {
+                    float t = -rs[k] / as[k];
+                    if (t < hi) hi = t;
+                } else if (rs[k] < 0) {
+                    hi = -1;
+                }
+            }
+            if (lo > hi)
+                continue;
+            int t0 = (int)ceilf(lo), t1 = (int)floorf(hi);
+            if (t1 > span) t1 = span;
+            long row = (long)py * w + minx;
+            float z = zr + dzx * t0;
+            for (int t = t0; t <= t1; t++, z += dzx) {
+                long i = row + t;
                 if (z > zbuf[i]) {
                     zbuf[i] = z;
                     out[i * 4] = r; out[i * 4 + 1] = g; out[i * 4 + 2] = b; out[i * 4 + 3] = 255;
