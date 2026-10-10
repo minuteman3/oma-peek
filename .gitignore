@@ -3,3 +3,5 @@ libmeshraster.so
 bench/data/
 bench/bench
 bench/ref/
+bench/e2e/data/
+bench/e2e/ref/
