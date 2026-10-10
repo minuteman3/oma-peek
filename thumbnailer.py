@@ -145,15 +145,38 @@ VERTEX_FAST = r'<vertex x="([^"]+)" y="([^"]+)" z="([^"]+)"'
 TRI_FAST = r'<triangle v1="(\d+)" v2="(\d+)" v3="(\d+)"'
 
 
-def iter_objects(data):
+def make_find(data):
+    """data.find, but long scans go through glibc memmem (~4x faster than bytes.find)."""
+    lib = native_lib() if len(data) > (1 << 20) else None
+    if not lib:
+        return data.find
+    import ctypes
+    if isinstance(data, bytearray):
+        keep = (ctypes.c_char * len(data)).from_buffer(data)
+        base = ctypes.addressof(keep)
+    else:
+        keep = ctypes.c_char_p(data)
+        base = ctypes.cast(keep, ctypes.c_void_p).value
+
+    def find(pat, start=0, end=None):
+        end = len(data) if end is None else min(end, len(data))
+        if end - start < (1 << 16):
+            return data.find(pat, start, end)
+        return lib.mp_find(base, start, end, pat, len(pat))
+    find.keep = keep        # keep the buffer export alive with the closure
+    return find
+
+
+def iter_objects(data, find=None):
     """Yield (attribute bytes, body start, body end) per <object>. Offsets, not
     slices: a mesh body can be ~100 MB and is parsed in place by mp_parse_mesh."""
+    find = find or data.find
     i = 0
     while True:
-        s = data.find(b'<object', i)
+        s = find(b'<object', i)
         if s < 0:
             return
-        e = data.find(b'>', s)
+        e = find(b'>', s)
         if e < 0:
             return
         head = data[s + 7:e]
@@ -164,7 +187,7 @@ def iter_objects(data):
             yield head[:-1], e + 1, e + 1
             i = e + 1
             continue
-        c = data.find(b'</object>', e)
+        c = find(b'</object>', e)
         if c < 0:
             c = len(data)
         yield head, e + 1, c
@@ -173,10 +196,11 @@ def iter_objects(data):
 
 def parse_model(data):
     objects = {}
-    for head, b0, b1 in iter_objects(data):
+    find = make_find(data)
+    for head, b0, b1 in iter_objects(data, find):
         a = attrs(head.decode('utf-8', 'replace'))
         obj = dict(mesh=None, comps=[])
-        has_mesh = data.find(b'<mesh', b0, b1) >= 0      # found near the start when present
+        has_mesh = find(b'<mesh', b0, b1) >= 0      # found near the start when present
         native = parse_mesh_native(data, b0, b1) if has_mesh else None
         if native is not None:
             if native.nv and native.nt:
@@ -222,9 +246,9 @@ def zip_member(f, info):
     name_len, extra_len = struct.unpack('<HH', hdr[26:30])
     f.seek(info.header_offset + 30 + name_len + extra_len)
     raw = f.read(info.compress_size)
-    if info.compress_type == zipfile.ZIP_STORED:
+    if info.compress_type == 0:         # stored
         return raw
-    if info.compress_type == zipfile.ZIP_DEFLATED:
+    if info.compress_type == 8:         # deflated
         lib = native_lib()
         if lib and info.file_size:
             import ctypes
@@ -238,8 +262,64 @@ def zip_member(f, info):
     return None
 
 
+class ZipEntry:
+    __slots__ = ('compress_type', 'compress_size', 'file_size', 'header_offset')
+
+    def __init__(self, ctype, csize, size, offset):
+        self.compress_type, self.compress_size, self.file_size, self.header_offset = ctype, csize, size, offset
+
+
+class MiniZip:
+    """Just enough of a zip reader for 3MF: the central directory via struct.
+    Importing zipfile costs ~35 ms (it pulls in shutil, pathlib, fnmatch, ...).
+    Raises ValueError for anything unusual (ZIP64, damage); callers then use zipfile."""
+
+    def __init__(self, path):
+        import struct
+        self.fp = open(path, 'rb')
+        f = self.fp
+        f.seek(0, 2)
+        size = f.tell()
+        tail_len = min(size, 65536 + 22)
+        f.seek(size - tail_len)
+        tail = f.read(tail_len)
+        eocd = tail.rfind(b'PK\x05\x06')
+        if eocd < 0 or eocd + 22 > len(tail):
+            raise ValueError('no end of central directory')
+        count, cd_size, cd_offset = struct.unpack('<HII', tail[eocd + 10:eocd + 20])
+        if count == 0xFFFF or cd_offset == 0xFFFFFFFF:
+            raise ValueError('zip64')
+        f.seek(cd_offset)
+        cd = f.read(cd_size)
+        self.entries, i = {}, 0
+        for _ in range(count):
+            if cd[i:i + 4] != b'PK\x01\x02':
+                raise ValueError('bad central directory')
+            ctype, = struct.unpack('<H', cd[i + 10:i + 12])
+            csize, usize, nlen, xlen, clen = struct.unpack('<IIHHH', cd[i + 20:i + 34])
+            offset, = struct.unpack('<I', cd[i + 42:i + 46])
+            if 0xFFFFFFFF in (csize, usize, offset):
+                raise ValueError('zip64')
+            name = cd[i + 46:i + 46 + nlen].decode('utf-8', 'replace')
+            self.entries[name] = ZipEntry(ctype, csize, usize, offset)
+            i += 46 + nlen + xlen + clen
+
+    def namelist(self):
+        return list(self.entries)
+
+    def getinfo(self, name):
+        return self.entries[name]
+
+    def read(self, name):
+        with zipfile.ZipFile(self.fp.name) as z:   # unusual compression: let zipfile handle it
+            return z.read(name)
+
+
 def load_3mf(path):
-    z = zipfile.ZipFile(path)
+    try:
+        z = MiniZip(path)
+    except (ValueError, OSError, IndexError):
+        z = zipfile.ZipFile(path)
     names = {n.lower(): n for n in z.namelist()}
 
     def read(p):
@@ -421,6 +501,8 @@ def native_lib():
         lib.mp_backdrop.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
         lib.mp_emit.restype = ctypes.c_long
         lib.mp_emit.argtypes = [ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+        lib.mp_find.restype = ctypes.c_long
+        lib.mp_find.argtypes = [ctypes.c_void_p, ctypes.c_long, ctypes.c_long, ctypes.c_char_p, ctypes.c_long]
         lib.mp_inflate.restype = ctypes.c_long
         lib.mp_inflate.argtypes = [ctypes.c_char_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_long]
     except AttributeError as e:    # stale or partial library: use the numpy path

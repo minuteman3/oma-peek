@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 // oma-peek native rasterizer: z-buffered flat-colour triangle fill.
 //
 // Projection and shading happen in numpy (thumbnailer.py); this only fills
@@ -338,6 +339,90 @@ static void norm3(double *v)
     if (l > 0) { v[0] /= l; v[1] /= l; v[2] /= l; }
 }
 
+typedef struct {
+    const int *counts;
+    const uint8_t *colours;
+    const float *tris;
+    int nparts;
+    long lo, hi;                    // triangle range for this worker
+    const double *d, *L, *right, *up;
+    float *xs, *ys, *zs;
+    uint8_t *rgb;
+    double x0, x1, y0, y1;          // view-space bounds of kept triangles in the range
+    long kept;
+} ShadeJob;
+
+// Shade and project triangles [lo, hi) at their own index. Degenerate triangles get
+// NaN coordinates, which mp_raster skips, so no compaction pass is needed.
+static void *shade_range(void *arg)
+{
+    ShadeJob *J = arg;
+    const double *d = J->d, *L = J->L, *right = J->right, *up = J->up;
+    double x0 = INFINITY, x1 = -INFINITY, y0 = INFINITY, y1 = -INFINITY;
+    long kept = 0, pend = 0;        // pend = end index of part k
+    int k = 0;
+    while (k < J->nparts - 1 && pend + J->counts[k] <= J->lo) pend += J->counts[k++];
+    pend += J->counts[k];
+    for (long t = J->lo; t < J->hi; t++) {
+        while (t >= pend && k < J->nparts - 1) pend += J->counts[++k];
+        const float *v = J->tris + t * 9;
+        double e1[3] = {v[3] - v[0], v[4] - v[1], v[5] - v[2]};
+        double e2[3] = {v[6] - v[0], v[7] - v[1], v[8] - v[2]};
+        double nn[3];
+        cross3(e1, e2, nn);
+        double nl = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+        if (!(nl > 0)) {
+            J->xs[t * 3] = J->xs[t * 3 + 1] = J->xs[t * 3 + 2] = NAN;
+            J->ys[t * 3] = J->ys[t * 3 + 1] = J->ys[t * 3 + 2] = 0;
+            J->zs[t * 3] = J->zs[t * 3 + 1] = J->zs[t * 3 + 2] = 0;
+            continue;
+        }
+        nn[0] /= nl; nn[1] /= nl; nn[2] /= nl;
+        double nd = nn[0] * d[0] + nn[1] * d[1] + nn[2] * d[2];
+        if (nd < 0) { nn[0] = -nn[0]; nn[1] = -nn[1]; nn[2] = -nn[2]; nd = -nd; }
+        double diffuse = nn[0] * L[0] + nn[1] * L[1] + nn[2] * L[2];
+        diffuse = diffuse < 0 ? 0 : diffuse > 1 ? 1 : diffuse;
+        double rim = nd > 1 ? 1 : nd;
+        double shade = 0.42 + 0.48 * diffuse + 0.12 * rim;
+        const uint8_t *col = J->colours + k * 3;
+        for (int c = 0; c < 3; c++) {
+            double sv = col[c] * shade;
+            J->rgb[t * 3 + c] = (uint8_t)(sv > 255 ? 255 : sv);
+        }
+        for (int j = 0; j < 3; j++) {
+            double px = v[j * 3], py = v[j * 3 + 1], pz = v[j * 3 + 2];
+            double sx = px * right[0] + py * right[1] + pz * right[2];
+            double sy = px * up[0] + py * up[1] + pz * up[2];
+            J->xs[t * 3 + j] = (float)sx;
+            J->ys[t * 3 + j] = (float)sy;
+            J->zs[t * 3 + j] = (float)(px * d[0] + py * d[1] + pz * d[2]);
+            if (sx < x0) x0 = sx;
+            if (sx > x1) x1 = sx;
+            if (sy < y0) y0 = sy;
+            if (sy > y1) y1 = sy;
+        }
+        kept++;
+    }
+    J->x0 = x0; J->x1 = x1; J->y0 = y0; J->y1 = y1; J->kept = kept;
+    return NULL;
+}
+
+typedef struct {
+    float *xs, *ys;
+    long lo, hi;
+    double cx, cy, scale, half;
+} FitJob;
+
+static void *fit_range(void *arg)
+{
+    FitJob *J = arg;
+    for (long i = J->lo; i < J->hi; i++) {
+        J->xs[i] = (float)((J->xs[i] - J->cx) * J->scale + J->half);
+        J->ys[i] = (float)(J->half - (J->ys[i] - J->cy) * J->scale);
+    }
+    return NULL;
+}
+
 int mp_render(int nparts, const int *counts, const uint8_t *colours, const float *tris,
               int res, const double *view, const double *light_dir, uint8_t *out, float *zbuf)
 {
@@ -349,68 +434,47 @@ int mp_render(int nparts, const int *counts, const uint8_t *colours, const float
     cross3(up0, d, right); norm3(right);
     cross3(d, right, up);
 
-    float *xs = malloc(n * 3 * sizeof(float)), *ys = malloc(n * 3 * sizeof(float)), *zs = malloc(n * 3 * sizeof(float));
+    float *xs = malloc(n * 3 * sizeof(float) + 4), *ys = malloc(n * 3 * sizeof(float) + 4), *zs = malloc(n * 3 * sizeof(float) + 4);
     uint8_t *rgb = malloc(n * 3 + 1);
     if (!xs || !ys || !zs || !rgb) {
         free(xs); free(ys); free(zs); free(rgb);
         return -2;
     }
 
-    // Pass 1: shade and project to view space, dropping degenerate triangles.
-    long m = 0, t = 0;
+    enum { MAXT = 16 };
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    int nt = n < 50000 ? 1 : cpus < 1 ? 1 : cpus > MAXT ? MAXT : (int)cpus;
+
+    // Pass 1 (parallel): shade and project to view space.
+    ShadeJob jobs[MAXT];
+    for (int j = 0; j < nt; j++)
+        jobs[j] = (ShadeJob){counts, colours, tris, nparts, n * j / nt, n * (j + 1) / nt,
+                             d, L, right, up, xs, ys, zs, rgb};
+    run_threads(shade_range, jobs, sizeof(ShadeJob), nt);
     double x0 = INFINITY, x1 = -INFINITY, y0 = INFINITY, y1 = -INFINITY;
-    for (int k = 0; k < nparts; k++) {
-        double cr = colours[k * 3], cg = colours[k * 3 + 1], cb = colours[k * 3 + 2];
-        for (int c = 0; c < counts[k]; c++, t++) {
-            const float *v = tris + t * 9;
-            double e1[3] = {v[3] - v[0], v[4] - v[1], v[5] - v[2]};
-            double e2[3] = {v[6] - v[0], v[7] - v[1], v[8] - v[2]};
-            double nn[3];
-            cross3(e1, e2, nn);
-            double nl = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
-            if (!(nl > 0))
-                continue;
-            nn[0] /= nl; nn[1] /= nl; nn[2] /= nl;
-            double nd = nn[0] * d[0] + nn[1] * d[1] + nn[2] * d[2];
-            if (nd < 0) { nn[0] = -nn[0]; nn[1] = -nn[1]; nn[2] = -nn[2]; nd = -nd; }
-            double diffuse = nn[0] * L[0] + nn[1] * L[1] + nn[2] * L[2];
-            diffuse = diffuse < 0 ? 0 : diffuse > 1 ? 1 : diffuse;
-            double rim = nd > 1 ? 1 : nd;
-            double shade = 0.42 + 0.48 * diffuse + 0.12 * rim;
-            double sr = cr * shade, sg = cg * shade, sb = cb * shade;
-            rgb[m * 3] = (uint8_t)(sr > 255 ? 255 : sr);
-            rgb[m * 3 + 1] = (uint8_t)(sg > 255 ? 255 : sg);
-            rgb[m * 3 + 2] = (uint8_t)(sb > 255 ? 255 : sb);
-            for (int j = 0; j < 3; j++) {
-                double px = v[j * 3], py = v[j * 3 + 1], pz = v[j * 3 + 2];
-                double sx = px * right[0] + py * right[1] + pz * right[2];
-                double sy = px * up[0] + py * up[1] + pz * up[2];
-                xs[m * 3 + j] = (float)sx;
-                ys[m * 3 + j] = (float)sy;
-                zs[m * 3 + j] = (float)(px * d[0] + py * d[1] + pz * d[2]);
-                if (sx < x0) x0 = sx;
-                if (sx > x1) x1 = sx;
-                if (sy < y0) y0 = sy;
-                if (sy > y1) y1 = sy;
-            }
-            m++;
-        }
+    long m = 0;
+    for (int j = 0; j < nt; j++) {
+        m += jobs[j].kept;
+        if (jobs[j].x0 < x0) x0 = jobs[j].x0;
+        if (jobs[j].x1 > x1) x1 = jobs[j].x1;
+        if (jobs[j].y0 < y0) y0 = jobs[j].y0;
+        if (jobs[j].y1 > y1) y1 = jobs[j].y1;
     }
     if (m == 0) {
         free(xs); free(ys); free(zs); free(rgb);
         return -1;
     }
 
-    // Pass 2: fit to the image (90% of the larger extent, centred).
+    // Pass 2 (parallel): fit to the image (90% of the larger extent, centred).
     double span = fmax(x1 - x0, y1 - y0);
     if (!(span > 0)) span = 1.0;
-    double scale = res * 0.9 / span, cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-    for (long i = 0; i < m * 3; i++) {
-        xs[i] = (float)((xs[i] - cx) * scale + res / 2.0);
-        ys[i] = (float)(res / 2.0 - (ys[i] - cy) * scale);
-    }
+    double scale = res * 0.9 / span;
+    FitJob fits[MAXT];
+    for (int j = 0; j < nt; j++)
+        fits[j] = (FitJob){xs, ys, 3 * n * j / nt, 3 * n * (j + 1) / nt, (x0 + x1) / 2, (y0 + y1) / 2, scale, res / 2.0};
+    run_threads(fit_range, fits, sizeof(FitJob), nt);
 
-    int drawn = mp_raster((int)m, xs, ys, zs, rgb, res, res, out, zbuf);
+    int drawn = mp_raster((int)n, xs, ys, zs, rgb, res, res, out, zbuf);
     free(xs); free(ys); free(zs); free(rgb);
     return drawn;
 }
@@ -561,6 +625,19 @@ int mp_thumb_stl(const uint8_t *data, long len, const uint8_t *colour, int size,
     int r = mp_thumb(1, &count, colour, tris, size, view, light, raw);
     free(tris);
     return r;
+}
+
+// --- substring search ---------------------------------------------------------
+//
+// glibc memmem is ~4x faster than Python's bytes.find on the 100 MB model XML.
+// Returns the offset of pat in buf[start:end], or -1.
+
+long mp_find(const char *buf, long start, long end, const char *pat, long patlen)
+{
+    if (start < 0 || end < start)
+        return -1;
+    const char *r = memmem(buf + start, (size_t)(end - start), pat, (size_t)patlen);
+    return r ? (long)(r - buf) : -1;
 }
 
 // --- inflate via libdeflate -------------------------------------------------------
