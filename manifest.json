@@ -4,7 +4,7 @@
   "name": "oma-peek",
   "version": "0.1.0",
   "author": "Miles McGuire",
-  "description": "Quick Look-style 3D previews in Nautilus: thumbnails and spacebar previews for STL, 3MF, OBJ, SCAD, STEP, IGES and glTF. Builds and installs itself when the shell starts.",
+  "description": "Quick Look-style 3D previews: Nautilus thumbnails and spacebar previews, and a Strata viewer action, for STL, 3MF, OBJ, SCAD, STEP, IGES and glTF. Builds and installs itself when the shell starts.",
   "kinds": [
     "service"
   ],

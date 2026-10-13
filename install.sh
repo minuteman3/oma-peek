@@ -3,6 +3,7 @@
 #   ~/.local/share/oma-peek/                 viewer page, CAD converter, uninstall script
 #   ~/.local/share/sushi/viewers/oma-peek.js  Sushi (Nautilus spacebar) viewer module
 #   ~/.local/share/thumbnailers/oma-peek.thumbnailer
+#   ~/.config/strata/actions/oma-peek/        Strata "Preview in oma-peek" action (if Strata is installed)
 #
 # The gnome-desktop thumbnailer sandbox only exposes /usr plus the input and
 # output files, so nothing in ~/.local can be executed from inside it. Instead
@@ -25,6 +26,7 @@ data="${XDG_DATA_HOME:-$HOME/.local/share}"
 runtime="$data/oma-peek"
 thumbnailers="$data/thumbnailers"
 viewers="$data/sushi/viewers"
+strata_config="${XDG_CONFIG_HOME:-$HOME/.config}/strata"
 build="${XDG_CACHE_HOME:-$HOME/.cache}/oma-peek/build"
 
 if_changed=0 notify=0 payload_file=""
@@ -46,7 +48,7 @@ notify() {
 # Everything that affects what gets installed.
 fingerprint() {
     (cd "$here" && cat install.sh uninstall.sh raster.c cad.cpp thumbnailer.py cflags ldlibs cad_ldlibs \
-        sushi/oma-peek.js $(find web -type f | sort)) | sha1sum | cut -d' ' -f1
+        sushi/oma-peek.js $(find gjs strata web -type f | sort)) | sha1sum | cut -d' ' -f1
 }
 stamp="$runtime/.installed"
 if ((if_changed)) && [ -z "$payload_file" ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$(fingerprint)" ]; then
@@ -113,7 +115,41 @@ else
     rm -f "$runtime/oma-peek-cad"
 fi
 install -m755 "$here/uninstall.sh" "$runtime/uninstall.sh"
+install -m644 "$here/gjs/omaPeekHost.js" "$here/gjs/oma-peek-open.js" "$runtime/"
+install -m755 "$here/strata/oma-peek-open" "$runtime/oma-peek-open"
 install -m644 "$here/sushi/oma-peek.js" "$viewers/oma-peek.js"
+
+# Strata has no preview plugins, so oma-peek joins its file menu as a custom action that
+# opens the viewer in its own window. Strata reads actions from disk when it builds a menu.
+if command -v strata >/dev/null || [ -d "$strata_config" ]; then
+    exts='"stl", "3mf", "obj", "scad"'
+    [ -f "$build/oma-peek-cad" ] && exts+=', "step", "stp", "iges", "igs", "gltf", "glb"'
+    mkdir -p "$strata_config/actions/oma-peek"
+    cat >"$strata_config/actions/oma-peek/action.toml" <<TOML
+# Written by oma-peek's install.sh; reinstalling overwrites it.
+schema_version = 1
+id = "oma-peek"
+name = "Preview in oma-peek"
+description = "Open the model in oma-peek's 3D viewer, with its plates and objects."
+icon = "search"
+enabled = true
+menu = "top"
+
+[when]
+kinds = ["file"]
+extensions = [$exts]
+min_items = 1
+max_items = 16
+
+[run]
+runtime = "command"
+program = "$runtime/oma-peek-open"
+args = ["{paths}"]
+mode = "whole-selection"
+working_directory = "parent"
+confirm = false
+TOML
+fi
 
 # Let Nautilus retry files it previously failed to thumbnail; restart the previewer so
 # Sushi loads the new viewer module next time.

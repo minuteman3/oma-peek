@@ -22,6 +22,8 @@ opening a slicer or CAD program:
   - an object list: hover highlights an object, click isolates it
   - slicer object names and filament colours from 3MF projects
   - colours follow your current Omarchy theme
+- **[Strata](https://github.com/lgse/strata)**: a **Preview in oma-peek** item in Strata's file
+  menu opens the same viewer in its own window (see [Strata](#strata)).
 - **Fast**: native C rendering, typically 0.1 s per thumbnail. A 1-million-triangle STL takes
   about 0.12 s and a 1-million-triangle 3MF about 0.4 s.
 - **User-local**: installs into your home directory. No root, and no changes to system files.
@@ -73,6 +75,19 @@ Optional:
 sudo pacman -S --needed nautilus sushi gcc python opencascade openscad libdeflate
 ```
 
+### Strata
+
+Strata draws its own thumbnails and quick previews and has no plugin hook for either, so
+the thumbnailer and spacebar preview above only apply to Nautilus. When Strata is installed,
+`install.sh` also adds a Strata custom action (`~/.config/strata/actions/oma-peek/`). Right-click
+a model and choose **Preview in oma-peek** (in [10xer mode](https://github.com/lgse/strata/blob/main/docs/10xer-mode.md),
+<kbd>;</kbd> then the action's number). This opens the viewer in a window, with the plate
+picker and object list that Strata's own preview doesn't have. <kbd>Esc</kbd>, <kbd>Q</kbd> or
+<kbd>Space</kbd> closes it.
+
+The window's class is `io.github.minuteman3.OmaPeek`, so a Hyprland window rule can float it.
+Outside Strata, `~/.local/share/oma-peek/oma-peek-open FILE...` opens the same window.
+
 ## Usage
 
 Thumbnails appear automatically. In the spacebar preview:
@@ -117,7 +132,8 @@ from memory.
   colours) and PNG output.
 
 **Spacebar preview.** Sushi loads extra viewer modules from `~/.local/share/sushi/viewers/`.
-`sushi/oma-peek.js` shows a three.js page (`web/`) in Sushi's WebKit view. SCAD and CAD files
+`sushi/oma-peek.js` shows a three.js page (`web/`) in Sushi's WebKit view; `gjs/omaPeekHost.js`
+loads the model, and the Strata window (`gjs/oma-peek-open.js`) shares it. SCAD and CAD files
 are first converted to a mesh (`openscad`, or the `oma-peek-cad` converter built from
 `cad.cpp`) and cached in `~/.cache/oma-peek/`.
 
@@ -125,7 +141,8 @@ Installed files:
 
 - `~/.local/share/thumbnailers/oma-peek.thumbnailer`
 - `~/.local/share/sushi/viewers/oma-peek.js`
-- `~/.local/share/oma-peek/`: viewer page, `oma-peek-cad`, `uninstall.sh`
+- `~/.local/share/oma-peek/`: viewer page, `oma-peek-cad`, `oma-peek-open`, `uninstall.sh`
+- `~/.config/strata/actions/oma-peek/`: the Strata action, if Strata is installed
 - `~/.cache/oma-peek/`: build directory and converted meshes
 
 **Limitations.**
