@@ -36,6 +36,7 @@ if [ "${1:-}" != --inner ]; then
     chmod 700 "$RUN"
     mkdir -p "$RUN/home/.config" "$RUN/home/.local/state"
     printf '%s' "$host_wayland" >"$RUN/.host-wayland"
+    readlink /proc/self/ns/pid >"$RUN/.host-pidns"
     exec env -i HOME="$RUN/home" XDG_CONFIG_HOME="$RUN/home/.config" XDG_STATE_HOME="$RUN/home/.local/state" \
         GSETTINGS_BACKEND=memory PATH="$PATH" USER="${USER:-}" LANG="${LANG:-C.UTF-8}" \
         TMPDIR="${TMPDIR:-/tmp}" XDG_RUNTIME_DIR="$RUN" \
@@ -45,9 +46,17 @@ if [ "${1:-}" != --inner ]; then
         dbus-run-session -- bash "${BASH_SOURCE[0]}" --inner
 fi
 
-RUN="$XDG_RUNTIME_DIR"
+# --inner is only valid as started above: inside a new PID namespace, with the private runtime
+# directory prepared by the outer run. Cleanup signals every process it can see, so refuse to
+# run anywhere else.
+RUN="${XDG_RUNTIME_DIR:-}"
+case "$RUN" in /tmp/opk.*) ;; *) echo "acceptance.sh: --inner is internal; run tests/acceptance.sh" >&2; exit 2 ;; esac
+if [ ! -f "$RUN/.host-pidns" ] || [ "$(cat "$RUN/.host-pidns")" = "$(readlink /proc/self/ns/pid)" ]; then
+    echo "acceptance.sh: --inner must run in its own PID namespace; run tests/acceptance.sh" >&2
+    exit 2
+fi
 host_wayland="$(cat "$RUN/.host-wayland")"
-rm -f "$RUN/.host-wayland"
+rm -f "$RUN/.host-wayland" "$RUN/.host-pidns"
 W="$(mktemp -d "${TMPDIR:-/tmp}/oma-peek-accept-XXXXXX")"
 nested=""
 # Everything in this PID namespace is ours: stop all of it (the private bus's init process,
