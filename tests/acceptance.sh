@@ -5,11 +5,14 @@
 #
 # Isolation from the user's session:
 # - everything runs in a fresh user + PID namespace (killed and reaped as a whole at the end)
-#   with a minimal environment: no host DISPLAY, WAYLAND_*, HYPRLAND_* or session bus;
+#   with a minimal environment: no host DISPLAY, WAYLAND_*, HYPRLAND_* or session bus, a
+#   private HOME and config directory, and GSettings kept in memory, so nothing can change
+#   the user's settings (dconf) or dotfiles;
 # - the private session bus and every client use a private runtime directory, so they can only
 #   find the nested compositor; D-Bus activated services get the nested environment too;
 # - the nested Hyprland reaches the user's compositor only as a Wayland client (one window),
 #   and is denied a seat (no DRM, no physical input): checked in its log before anything runs.
+#   Xwayland is off (it would inspect the shared /tmp/.X11-unix locks).
 #
 # run: XDG_DATA_HOME=<install> XDG_CACHE_HOME=<cache> FIXTURES=<dir> [CAD_FIXTURES=<dir>] bash tests/acceptance.sh
 # Exit 77 = skipped (no Wayland session to nest in, or a tool is missing).
@@ -31,8 +34,10 @@ if [ "${1:-}" != --inner ]; then
     # host socket path is handed over in a file, so it is in no process environment.
     RUN="$(mktemp -d /tmp/opk.XXXXXX)"
     chmod 700 "$RUN"
+    mkdir -p "$RUN/home/.config" "$RUN/home/.local/state"
     printf '%s' "$host_wayland" >"$RUN/.host-wayland"
-    exec env -i HOME="$HOME" PATH="$PATH" USER="${USER:-}" LANG="${LANG:-C.UTF-8}" \
+    exec env -i HOME="$RUN/home" XDG_CONFIG_HOME="$RUN/home/.config" XDG_STATE_HOME="$RUN/home/.local/state" \
+        GSETTINGS_BACKEND=memory PATH="$PATH" USER="${USER:-}" LANG="${LANG:-C.UTF-8}" \
         TMPDIR="${TMPDIR:-/tmp}" XDG_RUNTIME_DIR="$RUN" \
         XDG_DATA_HOME="$XDG_DATA_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
         FIXTURES="$FIXTURES" CAD_FIXTURES="${CAD_FIXTURES:-}" OMA_PEEK_KEEP="${OMA_PEEK_KEEP:-}" \
@@ -70,7 +75,14 @@ check() {
 pause() { python3 -c "import time; time.sleep($1)"; }
 
 # --- the nested compositor ----------------------------------------------------------------
-: >"$W/hyprland.lua"                     # defaults only: no autostart, no user bindings
+# Defaults otherwise: no autostart, no user bindings.
+cat >"$W/hyprland.lua" <<'LUA'
+hl.config({
+  xwayland = { enabled = false },
+  cursor = { sync_gsettings_theme = false },
+  ecosystem = { no_update_news = true, no_donation_nag = true },
+})
+LUA
 # Only this process is given the user's compositor socket. LIBSEAT_BACKEND names no real
 # backend, so it can't open a seat (no DRM, no physical input devices).
 LIBSEAT_BACKEND=oma-peek-no-seat WAYLAND_DISPLAY="$host_wayland" \
@@ -89,14 +101,15 @@ done
 [ -n "$sig" ] && [ -S "$RUN/$sock" ] || { echo "# skip: could not start a nested Hyprland"; exit 77; }
 hlog="$RUN/hypr/$sig/hyprland.log"
 if ! { grep -q 'libseat: failed to open a seat' "$hlog" && grep -q 'Starting the Wayland backend' "$hlog" &&
-       ! grep -q 'Starting the DRM backend' "$hlog"; }; then
-    echo "not ok - nested Hyprland runs without a seat, on the Wayland backend only"
+       ! grep -q 'Starting the DRM backend' "$hlog" && ! grep -qi 'xwayland' "$hlog"; }; then
+    echo "not ok - nested Hyprland runs without a seat or Xwayland, on the Wayland backend only"
     exit 1
 fi
-echo "ok - nested Hyprland runs without a seat, on the Wayland backend only"
+echo "ok - nested Hyprland runs without a seat or Xwayland, on the Wayland backend only"
 export WAYLAND_DISPLAY="$sock" HYPRLAND_INSTANCE_SIGNATURE="$sig"
-# Services the private bus starts on demand (portals, GVfs, accessibility) get the same.
-dbus-update-activation-environment XDG_RUNTIME_DIR WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE
+# Services the private bus starts on demand (portals, GVfs, dconf, accessibility) get the same.
+dbus-update-activation-environment XDG_RUNTIME_DIR WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE \
+    HOME XDG_CONFIG_HOME XDG_STATE_HOME GSETTINGS_BACKEND
 nested_alive() { kill -0 "$nested" 2>/dev/null; }
 nested_only() {
     [ -z "${WAYLAND_SOCKET:-}" ] && [ -z "${DISPLAY:-}" ] && [ "$XDG_RUNTIME_DIR" = "$RUN" ] &&
