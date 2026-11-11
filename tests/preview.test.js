@@ -7,8 +7,8 @@ import GLib from 'gi://GLib';
 import * as system from 'system';
 
 import {bootSushi, check, finish} from './lib/sushi.js';
-import {fakeLog, installFakeConverter, listDir, makeFifo, pageParams, pageState, pidAlive,
-    release, sleep, snapshotCoverage, waitFor} from './lib/view.js';
+import {fakeLog, installFakeConverter, listDir, pageParams, pageState, pidAlive, sleep,
+    snapshotCoverage, waitFor} from './lib/view.js';
 
 if (!(await bootSushi())) {
     print('# skip: Sushi 51 or newer is not installed');
@@ -110,28 +110,37 @@ function close(r) {
     check(r.readyCount === 1 && r.failure === null, 'stopped after ready: no extra signals');
 }
 {
-    // (c) Stopped during a conversion: the converter is killed, its temp file removed, and the
-    // model page never loads.
+    // (c) Stopped during a conversion that has written part of its output: the converter is
+    // killed, the partial output removed, and the model page never loads.
     installFakeConverter();
     GLib.setenv('FAKE_LOG', `${scratch}/converter.log`, true);
     GLib.setenv('FAKE_MPK', `${fixtures}/assembly.mpk`, true);
-    GLib.setenv('FAKE_GATE', makeFifo(`${scratch}/gate`), true);
+    GLib.mkdir_with_parents(`${scratch}/gates`, 0o755);
+    GLib.setenv('FAKE_GATES', `${scratch}/gates`, true);
     const step = `${scratch}/part.step`;
     GLib.file_set_contents(step, 'ISO-10303-21; fake');
     const r = open(step);
-    const started = await waitFor(() => fakeLog().length === 1);
-    check(started, 'conversion: converter started');
-    const {pid} = fakeLog()[0] ?? {};
+    GLib.unsetenv('FAKE_GATES');
+    check(await waitFor(() => fakeLog().length === 1), 'conversion: converter started');
+    const {pid, out} = fakeLog()[0] ?? {};
+    check(GLib.file_test(out ?? '', GLib.FileTest.EXISTS), 'conversion: partial output written');
     check(pageParams(r)?.status === 'progress', 'conversion: progress page shown while converting');
     close(r);
     check(await waitFor(() => !pidAlive(pid), 3000), 'stopped during conversion: converter process killed');
-    await sleep(500);
+    check(await waitFor(() => !GLib.file_test(out, GLib.FileTest.EXISTS), 3000), 'stopped during conversion: partial output removed');
     const cache = `${GLib.get_user_cache_dir()}/oma-peek/models`;
-    check(listDir(cache).length === 0, 'stopped during conversion: no temp or cached output left',
-        listDir(cache).join(','));
+    check(listDir(cache).length === 0, 'stopped during conversion: nothing cached', listDir(cache).join(','));
     check(pageParams(r)?.status !== 'model', 'stopped during conversion: model page never loaded');
-    release(`${scratch}/gate`);
-    GLib.unsetenv('FAKE_GATE');
+}
+{
+    // A viewer page whose script never starts (here: a module with a syntax error) fails the
+    // preview instead of showing "Loading…" forever. Runs last: it breaks the installed page.
+    const state = `${data}/oma-peek/web/state.js`;
+    GLib.file_set_contents(state, 'export const broken = ;\n');
+    const r = open(`${fixtures}/box-binary.stl`);
+    check(await waitFor(() => r.failure !== null, 10000), 'broken page: the preview fails', r.failure?.message);
+    check(r.readyCount === 0, 'broken page: never reported ready');
+    close(r);
 }
 
 GLib.spawn_command_line_sync(`rm -rf ${GLib.shell_quote(scratch)}`);

@@ -4,20 +4,27 @@ import { loadModel } from './loaders.js';
 import { initialState, reduce, isVisible, onPlate } from './state.js';
 
 // Host -> page (query string): status=progress|error|model, message, file, ext, name, theme.
-// Page -> host: one 'ready' message once the page shows something (progress or error text,
-// or the model), via the WebKit script message handler 'omaPeek' when the host registered it.
+// Page -> host, via the WebKit script message handler 'omaPeek': 'started' as soon as the
+// script runs, then one 'ready' once the page shows something (progress or error text, or the
+// model).
 const params = new URLSearchParams(location.search);
 const filePath = params.get('file');
 const status = params.get('status') || (filePath ? 'model' : 'error');
 const ext = (params.get('ext') || (filePath || '').split('.').pop()).toLowerCase();
 
+function post(message) {
+    try {
+        window.webkit?.messageHandlers?.omaPeek?.postMessage(JSON.stringify(message));
+    } catch (e) { /* not hosted by oma-peek (e.g. opened in a browser) */ }
+}
+// Every module this page needs has loaded: tell the host the page is alive.
+post({ event: 'started' });
+
 let readyPosted = false;
 function postReady(outcome) {
     if (readyPosted) return;
     readyPosted = true;
-    try {
-        window.webkit?.messageHandlers?.omaPeek?.postMessage(JSON.stringify({ event: 'ready', outcome }));
-    } catch (e) { /* not hosted by oma-peek (e.g. opened in a browser) */ }
+    post({ event: 'ready', outcome });
 }
 
 const $ = (id) => document.getElementById(id);

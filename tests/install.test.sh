@@ -80,6 +80,33 @@ mv "$W/plugins-1.saved" "$data/sushi/plugins-1"
 run --if-changed
 check "--if-changed repairs after a failed install" installed
 
+# Failure after the thumbnailer entry was rewritten but before the runtime was replaced, with
+# unchanged sources: the next --if-changed must still redo the install. Runs as the real user
+# (no root inside the namespace) so the read-only data directory is enforced.
+userns() { unshare --map-current-user --pid --fork --mount-proc "$@"; }
+chmod a-w "$data"
+userns bash "$src/install.sh" >"$W/out" 2>&1
+chmod u+w "$data"
+check "a reinstall failing before the runtime swap fails" bash -c '! grep -q "^installed" "$1"' _ "$W/out"
+check "the thumbnailer entry was already rewritten" test "$data/thumbnailers/oma-peek.thumbnailer" -nt "$data/oma-peek/host.js"
+run --if-changed
+check "--if-changed redoes an install that failed before the swap" installed
+
+# An install that arrives while an uninstall holds the lock waits, then builds from scratch
+# (the uninstall removed the build directory under the lock).
+lockfile="$XDG_STATE_HOME/oma-peek/install.lock"
+exec 8>"$lockfile"
+flock 8
+echo '// arrives during uninstall' >>"$src/web/viewer.js"
+run --if-changed 8>&- &
+ipid=$!
+sleep 1
+check "an install waits for an uninstall in progress" kill -0 "$ipid"
+rm -rf "$XDG_CACHE_HOME/oma-peek"         # what uninstall.sh removes while holding the lock
+exec 8>&-
+wait "$ipid"
+check "the waiting install succeeds after the uninstall" installed
+
 # --- sources changing during the build ------------------------------------------------------
 # The raster build reads cflags; -include of a FIFO makes gcc wait until the test lets it go.
 gate="$W/gate.h"

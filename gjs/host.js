@@ -8,8 +8,9 @@
 //   any -shutdown()-> Closed        any -load-failed / web process died-> Failed
 //
 // "Shown" includes the page showing an error for a broken file: that is a successful preview
-// of an error. Readiness comes from the page ('ready' script message), with a fallback timer
-// after the first document finishes loading in case the page script never runs.
+// of an error. The page reports 'started' once its script runs and 'ready' once it shows
+// something; readiness comes only from 'ready'. A document that finishes loading without
+// 'started' (its script failed to load) fails the session.
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -35,7 +36,9 @@ const SCAD_TYPES = ['application/x-openscad', 'text/x-openscad'];
 // CAD formats are converted by oma-peek-cad (OpenCASCADE) to the viewer's .mpk format.
 const CAD_TYPES = ['model/step', 'model/iges', 'model/gltf+json', 'model/gltf-binary'];
 const CAD_EXTS = ['step', 'stp', 'iges', 'igs', 'gltf', 'glb'];
-const READY_FALLBACK_MS = 3000;
+// After a document finishes loading, its script must report that it started within this
+// time; otherwise the page is broken (e.g. a module failed to load) and the preview fails.
+const PAGE_START_TIMEOUT_MS = 5000;
 const MESSAGE_HANDLER = 'omaPeek';
 
 export function isAvailable() {
@@ -192,25 +195,54 @@ async function runConverter(argv, cancellable) {
 function readHead(path, n) {
     const stream = Gio.File.new_for_path(path).read(null);
     try {
-        return stream.read_bytes(n, null).toArray();
+        const out = new Uint8Array(n);
+        let got = 0;
+        while (got < n) {
+            const chunk = stream.read_bytes(Math.min(n - got, 1 << 20), null).toArray();
+            if (!chunk.length)
+                break;
+            out.set(chunk, got);
+            got += chunk.length;
+        }
+        return out.subarray(0, got);
     } finally {
         stream.close(null);
     }
 }
 
+const BAD_OUTPUT = 'the converter produced no usable mesh';
+
+// Converter output must be complete before it is shown or cached. STL: a binary STL whose
+// size matches its triangle count, or ASCII. MPK: magic, a JSON header listing parts with
+// triangle counts, and exactly that many triangles (9 float32 each) after it.
 function validateOutput(path, outExt) {
     const size = Gio.File.new_for_path(path).query_info('standard::size', Gio.FileQueryInfoFlags.NONE, null).get_size();
-    const head = readHead(path, 4096);
-    const text = new TextDecoder().decode(head.subarray(0, 5));
-    if (outExt === 'stl' && !(size >= 84 || text === 'solid'))
-        throw new Error('the converter produced no usable mesh');
-    if (outExt === 'mpk') {
-        if (size < 8 || new TextDecoder().decode(head.subarray(0, 4)) !== 'MPK1')
-            throw new Error('the converter produced no usable mesh');
-        const len = new DataView(head.buffer, head.byteOffset, head.byteLength).getUint32(4, true);
-        if (8 + len > size)
-            throw new Error('the converter produced a truncated mesh');
+    const head = readHead(path, 84);
+    const dv = new DataView(head.buffer, head.byteOffset, head.byteLength);
+    if (outExt === 'stl') {
+        const ascii = new TextDecoder().decode(head.subarray(0, 5)) === 'solid';
+        const binary = size >= 84 && size === 84 + 50 * dv.getUint32(80, true);
+        if (!ascii && !binary)
+            throw new Error(BAD_OUTPUT);
+        return;
     }
+    if (size < 8 || new TextDecoder().decode(head.subarray(0, 4)) !== 'MPK1')
+        throw new Error(BAD_OUTPUT);
+    const len = dv.getUint32(4, true);
+    if (8 + len > size)
+        throw new Error(BAD_OUTPUT);
+    let header;
+    try {
+        header = JSON.parse(new TextDecoder().decode(readHead(path, 8 + len).subarray(8)));
+    } catch (e) {
+        throw new Error(BAD_OUTPUT);
+    }
+    const parts = header?.parts;
+    if (!Array.isArray(parts) || !parts.length || !parts.every((p) => Number.isInteger(p?.n) && p.n > 0))
+        throw new Error(BAD_OUTPUT);
+    const triangles = parts.reduce((t, p) => t + p.n, 0);
+    if (size !== 8 + len + triangles * 36)
+        throw new Error(BAD_OUTPUT);
 }
 
 // Resolves to {path, temporary}; temporary outputs belong to the caller.
@@ -225,30 +257,36 @@ async function convert(file, conversion, cancellable, attempts = 2) {
     if (conversion.persistent && GLib.file_test(out, GLib.FileTest.EXISTS))
         return {path: out, temporary: false};
 
+    // This attempt owns tmp until it is published or handed to the caller; any other way
+    // out (error, cancellation, the source changing or vanishing) removes it.
     const tmp = GLib.build_filenamev([CACHE_DIR, `.${key}.${GLib.uuid_string_random()}.${conversion.outExt}`]);
+    let owned = true;
+    let changed = false;
     try {
         await runConverter(conversion.argv(tmp), cancellable);
         validateOutput(tmp, conversion.outExt);
-    } catch (e) {
-        unlinkQuietly(tmp);
-        throw e;
-    }
-    if (sourceIdentity(file) !== identity) {
         // Edited while converting: the output may mix old and new content.
-        unlinkQuietly(tmp);
-        if (attempts > 1)
-            return convert(file, conversion, cancellable, attempts - 1);
-        throw new Error('the file kept changing during conversion');
+        changed = sourceIdentity(file) !== identity;
+        if (changed) {
+            if (attempts <= 1)
+                throw new Error('the file kept changing during conversion');
+        } else if (!conversion.persistent) {
+            owned = false;
+            return {path: tmp, temporary: true};
+        } else {
+            try {
+                Gio.File.new_for_path(tmp).move(Gio.File.new_for_path(out), Gio.FileCopyFlags.OVERWRITE, null, null);
+            } catch (e) {
+                throw new Error(`could not save the converted file: ${e.message}`);
+            }
+            owned = false;
+            return {path: out, temporary: false};
+        }
+    } finally {
+        if (owned)
+            unlinkQuietly(tmp);
     }
-    if (!conversion.persistent)
-        return {path: tmp, temporary: true};
-    try {
-        Gio.File.new_for_path(tmp).move(Gio.File.new_for_path(out), Gio.FileCopyFlags.OVERWRITE, null, null);
-    } catch (e) {
-        unlinkQuietly(tmp);
-        throw new Error(`could not save the converted file: ${e.message}`);
-    }
-    return {path: out, temporary: false};
+    return convert(file, conversion, cancellable, attempts - 1);
 }
 
 // --- session -----------------------------------------------------------------------------
@@ -260,7 +298,8 @@ export class Session {
     #cancellable = new Gio.Cancellable();
     #handlers = [];
     #contentManager = null;
-    #readyTimer = 0;
+    #startTimer = 0;
+    #pageStarted = false;
     #temps = [];
     #ready = false;
     #closed = false;
@@ -284,8 +323,13 @@ export class Session {
         this.#connect(this.#contentManager, `script-message-received::${MESSAGE_HANDLER}`,
             (_m, value) => this.#onMessage(value));
         this.#connect(view, 'load-changed', (_v, event) => {
-            if (event === WebKit.LoadEvent.FINISHED)
-                this.#armReadyFallback();
+            // Each navigation must start its own script.
+            if (event === WebKit.LoadEvent.STARTED) {
+                this.#pageStarted = false;
+                this.#clearStartTimer();
+            } else if (event === WebKit.LoadEvent.FINISHED && !this.#pageStarted) {
+                this.#armStartTimer();
+            }
         });
         this.#connect(view, 'load-failed', (_v, _event, _uri, error) => {
             this.#onLoadFailed(error);
@@ -309,10 +353,7 @@ export class Session {
             return;
         this.#closed = true;
         this.#cancellable.cancel();
-        if (this.#readyTimer) {
-            GLib.source_remove(this.#readyTimer);
-            this.#readyTimer = 0;
-        }
+        this.#clearStartTimer();
         for (const [obj, id] of this.#handlers)
             obj.disconnect(id);
         this.#handlers = [];
@@ -373,28 +414,36 @@ export class Session {
         } catch (e) {
             return;
         }
+        if (msg?.event === 'started' || msg?.event === 'ready') {
+            this.#pageStarted = true;
+            this.#clearStartTimer();
+        }
         if (msg?.event === 'ready')
             this.#markReady();
     }
 
-    #armReadyFallback() {
-        if (this.#ready || this.#readyTimer || this.#closed)
+    #armStartTimer() {
+        if (this.#startTimer || this.#closed)
             return;
-        this.#readyTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, READY_FALLBACK_MS, () => {
-            this.#readyTimer = 0;
-            this.#markReady();
+        this.#startTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, PAGE_START_TIMEOUT_MS, () => {
+            this.#startTimer = 0;
+            this.#fail(new GLib.Error(Gio.IOErrorEnum, Gio.IOErrorEnum.FAILED,
+                'The 3D viewer page did not start; reinstall oma-peek'));
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    #clearStartTimer() {
+        if (this.#startTimer) {
+            GLib.source_remove(this.#startTimer);
+            this.#startTimer = 0;
+        }
     }
 
     #markReady() {
         if (this.#ready || this.#closed)
             return;
         this.#ready = true;
-        if (this.#readyTimer) {
-            GLib.source_remove(this.#readyTimer);
-            this.#readyTimer = 0;
-        }
         this.#onReady();
     }
 

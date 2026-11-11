@@ -53,7 +53,10 @@ notify() {
 }
 
 # Everything that affects what gets installed: every source file (by relative name and
-# content), plus the parts of the system the install adapts to.
+# content), plus the parts of the system the install adapts to. WebKit 6 counts only as
+# present/absent: the plugin checks for it at run time, but the previewer must be restarted
+# (by a reinstall) to pick up a newly installed WebKit. openscad is looked up at preview time
+# and changes nothing installed, so it is not part of the fingerprint.
 fingerprint() {
     (
         cd "$here"
@@ -85,9 +88,12 @@ restart_previewer() {
 
 # One install or uninstall at a time. A second request waits, then re-checks the state, so
 # it is never dropped while the first one installs older sources.
-mkdir -p "$(dirname "$lock")" "$build"
+# Only the lock's own directory is created before locking: an uninstall holding the lock may
+# be removing everything else (the build directory included).
+mkdir -p "$(dirname "$lock")"
 exec 9>"$lock"
 flock -w 300 9 || { echo "oma-peek: timed out waiting for another install" >&2; exit 1; }
+mkdir -p "$build"
 
 if ((if_changed)) && [ -z "$payload_file" ] && installed_ok "$(fingerprint_id)"; then
     exit 0

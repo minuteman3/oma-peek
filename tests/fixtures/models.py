@@ -226,6 +226,19 @@ cases.append({'file': 'assembly.mpk', 'ext': 'mpk', 'yUp': False, 'plates': ['Mo
     part('Body (2)', 12, bbox(1, 1, 1, 50, 0, 0)),
 ]})
 
+# Malformed MPK: header not JSON; header promising triangles that are missing.
+def raw(name, data):
+    with open(os.path.join(OUT, name), 'wb') as f:
+        f.write(data)
+
+raw('bad-header.mpk', b'MPK1' + struct.pack('<I', 5) + b'{bad}')
+head = json.dumps({'parts': [{'name': 'Body', 'color': None, 'n': 12}]}).encode()
+raw('truncated.mpk', b'MPK1' + struct.pack('<I', len(head)) + head + b'\0' * 36)
+cases += [
+    {'file': 'bad-header.mpk', 'ext': 'mpk', 'error': 'malformed mpk'},
+    {'file': 'truncated.mpk', 'ext': 'mpk', 'error': 'malformed mpk'},
+]
+
 with open(os.path.join(OUT, 'manifest.json'), 'w') as f:
     json.dump(cases, f, indent=1)
 print(f'{len(cases)} fixture cases in {OUT}')

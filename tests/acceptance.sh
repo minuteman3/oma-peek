@@ -2,12 +2,12 @@
 # T9: acceptance on a real Hyprland session. Drives the real Sushi previewer (on a private
 # session bus) and the standalone viewer window against an isolated install, takes
 # screenshots, and closes windows with real key presses (wtype). Windows appear briefly on
-# the current workspace and take focus.
+# the current workspace and take focus. Only windows of processes this script started (matched
+# by PID) are ever selected, focused or closed.
 #
 # run: XDG_DATA_HOME=<install> XDG_CACHE_HOME=<cache> FIXTURES=<dir> [CAD_FIXTURES=<dir>] bash tests/acceptance.sh
-# Exit 77 = skipped (not in a Hyprland session, or a tool is missing).
+# Exit 77 = skipped (not in a Hyprland session, display asleep, or a tool is missing).
 set -uo pipefail
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # The display must exist before anything GTK starts: without one the previewer crashes.
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -24,6 +24,20 @@ for tool in hyprctl grim wtype dbus-run-session gdbus python3; do
 done
 [ -n "$WAYLAND_DISPLAY" ] && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && hyprctl version >/dev/null 2>&1 ||
     { echo "# skip: no Hyprland session"; exit 77; }
+# Typing into a locked session would type into the lock screen's password field, and window
+# queries cannot tell (the compositor still reports the last focused window). Omarchy's lock is
+# part of its shell; logind's LockedHint covers other lockers.
+session_locked() {
+    if command -v omarchy-shell >/dev/null && [ "$(omarchy-shell lock isLocked 2>/dev/null)" = true ]; then
+        return 0
+    fi
+    local s
+    for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$(id -un)" '$3 == u {print $1}'); do
+        [ "$(loginctl show-session "$s" -p LockedHint --value 2>/dev/null)" = yes ] && return 0
+    done
+    return 1
+}
+session_locked && { echo "# skip: the session is locked; unlock it and run again"; exit 77; }
 # Screen capture waits for a frame, which never comes while the monitors sleep.
 hyprctl monitors -j | python3 -c 'import json,sys; sys.exit(0 if any(m["dpmsStatus"] for m in json.load(sys.stdin)) else 1)' ||
     { echo "# skip: the display is asleep (DPMS off); wake it and run again"; exit 77; }
@@ -35,30 +49,39 @@ fi
 
 W="$(mktemp -d "${TMPDIR:-/tmp}/oma-peek-accept-XXXXXX")"
 pids=()
-trap 'for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done; rm -rf "$W"' EXIT
+trap 'for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done; [ -n "${OMA_PEEK_KEEP:-}" ] && echo "# kept $W" || rm -rf "$W"' EXIT
 fails=0
 check() {
     local name="$1"; shift
-    if "$@"; then echo "ok - $name"; else echo "not ok - $name"; fails=$((fails + 1)); fi
+    if "$@"; then echo "ok - $name"; return 0; fi
+    echo "not ok - $name"; fails=$((fails + 1)); return 1
 }
 pause() { python3 -c "import time; time.sleep($1)"; }
 
-clients() { # clients CLASS -> one "address x,y wxh" line per window
+# Window queries see the whole compositor, so every query is scoped to a process this script
+# started: the user's own windows are never selected, focused or closed.
+clients() { # clients PID [TITLE] -> one "address x,y wxh" line per window of that process
+    [ -n "${1:-}" ] || return 0
     hyprctl clients -j | python3 -c '
 import json, sys
+pid, title = int(sys.argv[1]), sys.argv[2] if len(sys.argv) > 2 else None
 for c in json.load(sys.stdin):
-    if c["class"] == sys.argv[1]:
+    if c["pid"] == pid and (title is None or c["title"] == title):
         (x, y), (w, h) = c["at"], c["size"]
-        print(c["address"], "%d,%d %dx%d" % (x, y, w, h))' "$1"
+        print(c["address"], "%d,%d %dx%d" % (x, y, w, h))' "$@"
 }
-wait_windows() { # wait_windows CLASS COUNT [seconds]
+wait_windows() { # wait_windows PID COUNT [seconds]
     for _ in $(seq $((${3:-10} * 10))); do
         [ "$(clients "$1" | wc -l)" -eq "$2" ] && return 0
         pause 0.1
     done
     return 1
 }
-# The centre of the window differs clearly from its top-left content corner.
+bus_owner_pid() { # bus_owner_pid NAME: PID owning NAME on our private bus
+    gdbus call --session -d org.freedesktop.DBus -o /org/freedesktop/DBus \
+        -m org.freedesktop.DBus.GetConnectionUnixProcessID "$1" 2>/dev/null | sed -n 's/^(uint32 \([0-9]*\),)$/\1/p'
+}
+# The centre of the window differs clearly from its content's left edge.
 drawn() { # drawn "x,y wxh" PNG
     grim -g "$1" "$2" 2>/dev/null && python3 -I - "$2" <<'PY'
 import sys
@@ -73,85 +96,100 @@ PY
 # Hyprland 0.56+ takes Lua dispatcher calls.
 focus_window() { hyprctl dispatch "hl.dsp.focus({ window = \"address:$1\" })" >/dev/null; }
 close_window() { hyprctl dispatch "hl.dsp.window.close({ window = \"address:$1\" })" >/dev/null; }
-press() { # press ADDRESS KEY: focus the window and type KEY into it, only if focus landed
+press() { # press ADDRESS KEY: type KEY into the window, only if it has focus and the session is unlocked
+    session_locked && { echo "# refusing to type: the session is locked"; return 1; }
     focus_window "$1"
     pause 0.4
+    session_locked && { echo "# refusing to type: the session is locked"; return 1; }
     local active
     active="$(hyprctl -j activewindow | python3 -c 'import json,sys; print(json.load(sys.stdin).get("address",""))')"
     [ "$active" = "$1" ] && wtype -k "$2"
 }
 
+# --- Sushi: model shown, closes on Space and Escape with the 3D view focused -----------------
 PREVIEWER=org.gnome.NautilusPreviewer
-show() { # show FILE: ask the previewer to show FILE (it is activated on our private bus)
+show() { # show FILE: ask our previewer to show FILE
     gdbus call --session -d $PREVIEWER -o /org/gnome/NautilusPreviewer \
         -m org.gnome.NautilusPreviewer2.ShowFile "file://$1" "" false "" >/dev/null
 }
 /usr/lib/org.gnome.NautilusPreviewer >"$W/previewer.log" 2>&1 &
-pids+=($!)
+sushi=$!
+pids+=("$sushi")
 gdbus wait --session --timeout 15 $PREVIEWER
+check "Sushi: our previewer owns its bus name" test "$(bus_owner_pid $PREVIEWER)" = "$sushi"
 
-# --- Sushi: model shown, closes on Space and Escape with the 3D view focused -----------------
 for key in space Escape; do
     show "$FIXTURES/box-binary.stl"
-    check "Sushi ($key): preview window opens" wait_windows $PREVIEWER 1
+    check "Sushi ($key): preview window opens" wait_windows "$sushi" 1 || continue
     pause 2.5
-    read -r addr geom < <(clients $PREVIEWER)
+    read -r addr geom < <(clients "$sushi")
     check "Sushi ($key): model drawn" drawn "$geom" "$W/sushi-$key.png"
     press "$addr" "$key"
-    check "Sushi: $key closes the preview" wait_windows $PREVIEWER 0 5
+    check "Sushi: $key closes the preview" wait_windows "$sushi" 0 5
 done
 if [ -n "${CAD_FIXTURES:-}" ] && [ -x "$XDG_DATA_HOME/oma-peek/oma-peek-cad" ]; then
     show "$CAD_FIXTURES/assembly.step"
-    wait_windows $PREVIEWER 1
-    pause 4
-    read -r addr geom < <(clients $PREVIEWER)
-    check "Sushi: STEP converted and drawn" drawn "$geom" "$W/sushi-step.png"
-    press "$addr" Escape
-    wait_windows $PREVIEWER 0 5
+    if check "Sushi: STEP preview opens" wait_windows "$sushi" 1; then
+        pause 4
+        read -r addr geom < <(clients "$sushi")
+        check "Sushi: STEP converted and drawn" drawn "$geom" "$W/sushi-step.png"
+        press "$addr" Escape
+        wait_windows "$sushi" 0 5
+    fi
 fi
 check "Sushi: plugin loaded without errors" bash -c '! grep -E "oma-peek|JS ERROR" "$1"' _ "$W/previewer.log"
 
 # --- standalone viewer (Strata action) ------------------------------------------------------
 APP=io.github.minuteman3.OmaPeek
 open_cmd="$XDG_DATA_HOME/oma-peek/oma-peek-open"
-"$open_cmd" "$FIXTURES/box-binary.stl" "$FIXTURES/generic.3mf"
-check "standalone: two files open two windows" wait_windows $APP 2
-"$open_cmd" "$FIXTURES/two-groups.obj"
-check "standalone: a second launch opens in the running instance" wait_windows $APP 3
-pause 1
-check "standalone: one viewer process" test "$(pgrep -fc 'gjs -m .*oma-peek-open\.js')" -eq 1
-read -r addr geom < <(clients $APP | head -1)
-check "standalone: model drawn" drawn "$geom" "$W/standalone.png"
-press "$addr" q
-check "standalone: Q closes one window" wait_windows $APP 2 5
+fake_converter() { # gated: each run logs "pid file", then waits on $W/gate-<file>
+    printf '%s\n' '#!/bin/bash' \
+        "echo \"\$\$ \$(basename \"\$1\")\" >>'$W/conv.log'" \
+        "read -r _ <\"$W/gate-\$(basename \"\$1\")\"" \
+        "cp '$FIXTURES/assembly.mpk' \"\$2\"" >"$XDG_DATA_HOME/oma-peek/oma-peek-cad"
+    chmod +x "$XDG_DATA_HOME/oma-peek/oma-peek-cad"
+}
+standalone() {
+    local app="" addr geom
+    "$open_cmd" "$FIXTURES/box-binary.stl" "$FIXTURES/generic.3mf"
+    for _ in $(seq 50); do app="$(bus_owner_pid $APP)"; [ -n "$app" ] && break; pause 0.1; done
+    check "standalone: viewer starts on our bus" test -n "$app" || return
+    pids+=("$app")
+    check "standalone: two files open two windows" wait_windows "$app" 2 || return
+    "$open_cmd" "$FIXTURES/two-groups.obj"
+    check "standalone: a second launch opens in the running instance" wait_windows "$app" 3 || return
+    check "standalone: still one viewer process" test "$(bus_owner_pid $APP)" = "$app"
+    read -r addr geom < <(clients "$app" | head -1)
+    check "standalone: model drawn" drawn "$geom" "$W/standalone.png"
+    press "$addr" q
+    check "standalone: Q closes one window" wait_windows "$app" 2 5 || return
 
-# Closing a window stops its own conversion only (fake converter, gated).
-cp "$XDG_DATA_HOME/oma-peek/oma-peek-cad" "$W/real-cad" 2>/dev/null
-cat >"$XDG_DATA_HOME/oma-peek/oma-peek-cad" <<EOF
-#!/bin/bash
-echo "\$\$ \$1" >>"$W/conv.log"
-cat "$W/gate-\$(basename "\$1")" >/dev/null
-cp "$FIXTURES/assembly.mpk" "\$2"
-EOF
-chmod +x "$XDG_DATA_HOME/oma-peek/oma-peek-cad"
-for n in a b; do echo fake >"$W/$n.step"; mkfifo "$W/gate-$n.step"; done
-for _ in 1 2; do read -r a _ < <(clients $APP); close_window "$a"; pause 0.3; done
-"$open_cmd" "$W/a.step" "$W/b.step"
-wait_windows $APP 2
-for _ in $(seq 50); do [ "$(wc -l <"$W/conv.log" 2>/dev/null || echo 0)" -eq 2 ] && break; pause 0.1; done
-pid_a="$(awk '/a.step/ {print $1}' "$W/conv.log")"
-pid_b="$(awk '/b.step/ {print $1}' "$W/conv.log")"
-title_a="$(hyprctl clients -j | python3 -c 'import json,sys; print(next(c["address"] for c in json.load(sys.stdin) if c["title"]=="a.step"))')"
-close_window "$title_a"
-pause 1
-check "standalone: closing a window kills its conversion" bash -c '! kill -0 "$1" 2>/dev/null' _ "$pid_a"
-check "standalone: the other window's conversion continues" kill -0 "$pid_b"
-: >"$W/gate-b.step"
-pause 2
-read -r addr geom < <(clients $APP)
-check "standalone: the other window shows its model" drawn "$geom" "$W/standalone-b.png"
-[ -f "$W/real-cad" ] && cp "$W/real-cad" "$XDG_DATA_HOME/oma-peek/oma-peek-cad"
-press "$addr" Escape
-check "standalone: Escape closes the last window" wait_windows $APP 0 5
+    # Closing a window stops its own conversion only.
+    cp "$XDG_DATA_HOME/oma-peek/oma-peek-cad" "$W/real-cad" 2>/dev/null
+    fake_converter
+    for f in a b; do echo fake >"$W/$f.step"; mkfifo "$W/gate-$f.step"; done
+    while read -r a _; do close_window "$a"; done < <(clients "$app")
+    wait_windows "$app" 0 5
+    "$open_cmd" "$W/a.step" "$W/b.step"
+    check "standalone: two converting windows open" wait_windows "$app" 2 || return
+    for _ in $(seq 50); do [ "$(wc -l <"$W/conv.log" 2>/dev/null || echo 0)" -eq 2 ] && break; pause 0.1; done
+    local pid_a pid_b win_a
+    pid_a="$(awk '$2 == "a.step" {print $1}' "$W/conv.log")"
+    pid_b="$(awk '$2 == "b.step" {print $1}' "$W/conv.log")"
+    read -r win_a _ < <(clients "$app" a.step)
+    check "standalone: both conversions started" test -n "$pid_a" -a -n "$pid_b" -a -n "$win_a" || return
+    close_window "$win_a"
+    check "standalone: closing a window kills its conversion" \
+        bash -c 'for _ in $(seq 30); do kill -0 "$1" 2>/dev/null || exit 0; sleep 0.1; done; exit 1' _ "$pid_a"
+    check "standalone: the other window's conversion continues" kill -0 "$pid_b"
+    echo go >"$W/gate-b.step"
+    pause 2
+    read -r addr geom < <(clients "$app")
+    check "standalone: the other window shows its model" drawn "$geom" "$W/standalone-b.png"
+    [ -f "$W/real-cad" ] && cp "$W/real-cad" "$XDG_DATA_HOME/oma-peek/oma-peek-cad"
+    press "$addr" Escape
+    check "standalone: Escape closes the last window" wait_windows "$app" 0 5
+}
+standalone
 
 exit $((fails ? 1 : 0))

@@ -510,7 +510,15 @@ function loadMPK(bytes) {
     if (new TextDecoder().decode(bytes.subarray(0, 4)) !== 'MPK1')
         throw new Error('not an MPK file');
     const len = dv.getUint32(4, true);
-    const head = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + len)));
+    let head;
+    try {
+        head = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + len)));
+    } catch (e) {
+        throw new Error('malformed MPK: bad header');
+    }
+    if (!Array.isArray(head?.parts)) throw new Error('malformed MPK: bad header');
+    const need = head.parts.reduce((t, p) => t + (Number.isInteger(p?.n) && p.n >= 0 ? p.n : NaN), 0) * 36;
+    if (!(8 + len + need <= bytes.byteLength)) throw new Error('malformed MPK: truncated');
     let off = 8 + len;
     const parts = head.parts.map((p) => {
         const count = p.n * 9;
@@ -538,6 +546,9 @@ function validate(model) {
     if (!model.parts.length) throw new Error('This file contains no geometry.');
     for (const p of model.parts) {
         if (p.indices.length % 3) throw new Error('malformed model: incomplete triangle');
+        const vertices = p.positions.length / 3;
+        for (let i = 0; i < p.indices.length; i++)
+            if (p.indices[i] >= vertices) throw new Error('malformed model: missing vertices');
         for (let i = 0; i < p.positions.length; i++)
             if (!Number.isFinite(p.positions[i])) throw new Error('malformed model: non-finite coordinate');
     }

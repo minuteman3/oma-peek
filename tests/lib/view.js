@@ -82,18 +82,38 @@ export function snapshotCoverage(view, WebKit) {
 
 // Replace the installed CAD converter with a script controlled through environment variables
 // (Gio.Subprocess passes the test process environment through):
-//   FAKE_LOG   append "pid src out" per run      FAKE_GATE  FIFO to block on before writing
-//   FAKE_MPK   valid output to copy              FAKE_MODE  ok | fail | short | lockdir
+//   FAKE_LOG    append "pid src out tag" per run        FAKE_TAG  label for this run
+//   FAKE_MPK    valid output to copy                    FAKE_MODE see below; a file
+//                                                       <source>.mode overrides it for every
+//                                                       attempt (retries spawn after open())
+//   FAKE_GATES  directory: write a partial output, log, then block on the FIFO
+//               FAKE_GATES/<pid> (bash's own redirection, so killing the converter unblocks it)
+// Modes: ok, fail (exit 1 with an error), short (3 bytes), badmpk (header not JSON),
+// truncmpk (header promises triangles that are missing), lockdir (cache dir made read-only
+// after writing), touchsrc (edit the source during the first run only), alwaystouch.
 export function installFakeConverter() {
     const path = GLib.build_filenamev([GLib.get_user_data_dir(), 'oma-peek', 'oma-peek-cad']);
     GLib.file_set_contents(path, `#!/bin/bash
-echo "$$ $1 $2" >> "$FAKE_LOG"
-[ -n "\${FAKE_GATE:-}" ] && cat "$FAKE_GATE" >/dev/null
-case "\${FAKE_MODE:-ok}" in
+src="$1" out="$2"
+if [ -n "\${FAKE_GATES:-}" ]; then
+    printf partial >"$out"
+    mkfifo "$FAKE_GATES/$$"
+    echo "$$ $src $out \${FAKE_TAG:-}" >>"$FAKE_LOG"
+    read -r _ <"$FAKE_GATES/$$"
+else
+    echo "$$ $src $out \${FAKE_TAG:-}" >>"$FAKE_LOG"
+fi
+mode="\${FAKE_MODE:-ok}"
+[ -f "$src.mode" ] && mode="$(cat "$src.mode")"
+case "$mode" in
   fail) echo "ERROR: fake converter failure" >&2; exit 1 ;;
-  short) printf abc >"$2" ;;
-  lockdir) cat "$FAKE_MPK" >"$2"; chmod a-w "$(dirname "$2")" ;;
-  *) cat "$FAKE_MPK" >"$2" ;;
+  short) printf abc >"$out" ;;
+  badmpk) printf 'MPK1\\x05\\x00\\x00\\x00{bad}' >"$out" ;;
+  truncmpk) printf 'MPK1\\x14\\x00\\x00\\x00{"parts":[{"n":12}]}' >"$out" ;;
+  lockdir) cat "$FAKE_MPK" >"$out"; chmod a-w "$(dirname "$out")" ;;
+  touchsrc) cat "$FAKE_MPK" >"$out"; [ -e "$src.touched" ] || { touch "$src.touched"; echo edit >>"$src"; } ;;
+  alwaystouch) cat "$FAKE_MPK" >"$out"; echo edit >>"$src" ;;
+  *) cat "$FAKE_MPK" >"$out" ;;
 esac
 `);
     GLib.chmod(path, 0o755);
@@ -104,22 +124,18 @@ export function fakeLog() {
     try {
         return new TextDecoder().decode(GLib.file_get_contents(GLib.getenv('FAKE_LOG'))[1])
             .split('\n').filter(Boolean).map((l) => {
-                const [pid, src, out] = l.split(' ');
-                return {pid: +pid, src, out};
+                const [pid, src, out, tag] = l.split(' ');
+                return {pid: +pid, src, out, tag};
             });
     } catch (e) {
         return [];
     }
 }
 
-export function makeFifo(path) {
-    GLib.spawn_command_line_sync(`mkfifo ${GLib.shell_quote(path)}`);
-    return path;
-}
-
-// Opening the FIFO for writing releases every converter blocked on it.
-export function release(fifo) {
-    GLib.spawn_command_line_async(`sh -c ${GLib.shell_quote(`: > ${GLib.shell_quote(fifo)}`)}`);
+// Let one gated converter run (FAKE_GATES mode). Opening the FIFO waits for its reader.
+export function releaseConverter(gates, pid) {
+    const fifo = `${gates}/${pid}`;
+    GLib.spawn_command_line_async(`sh -c ${GLib.shell_quote(`echo go > ${GLib.shell_quote(fifo)}`)}`);
 }
 
 export function pidAlive(pid) {
