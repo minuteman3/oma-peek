@@ -176,29 +176,62 @@ for (const mode of ['short', 'badmpk', 'truncmpk', 'nanmpk']) {
 
 // A big mesh is validated without blocking the main loop (the previewer must stay able to
 // close or switch previews), and a NaN in its very last coordinate is still found.
+// The longest main-loop stall is measured with a 10 ms ticker on the monotonic clock, up to
+// the moment the preview settles. A busy machine can stall any process, so the best of up
+// to three runs counts: blocking validation stalls every run (~330 ms for 128 MB here).
 {
-    let last = Date.now(), worst = 0;
-    const tick = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 10, () => {
-        const now = Date.now();
-        worst = Math.max(worst, now - last);
-        last = now;
-        return GLib.SOURCE_CONTINUE;
-    });
-    const big = source('step');
-    GLib.file_set_contents(`${big}.mode`, 'bigmpk');
-    const p = open(big);
-    await waitFor(() => settled(p), 30000);
-    GLib.source_remove(tick);
-    check(pageParams(p.view)?.status === 'model', 'big mesh: validated and shown', pageParams(p.view)?.message);
-    print(`# longest main-loop stall: ${worst} ms`);
-    check(worst < 120, 'big mesh: the main loop kept running during validation', `longest stall ${worst} ms`);
-    p.session.shutdown();
+    const measure = async () => {
+        let last = GLib.get_monotonic_time(), worst = 0;
+        const note = () => {
+            const now = GLib.get_monotonic_time();
+            worst = Math.max(worst, (now - last) / 1000);
+            last = now;
+        };
+        const tick = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 10, () => {
+            note();
+            return GLib.SOURCE_CONTINUE;
+        });
+        const big = source('step');
+        GLib.file_set_contents(`${big}.mode`, 'bigmpk');
+        const p = open(big);
+        const ok = await waitFor(() => settled(p), 30000);
+        note();
+        GLib.source_remove(tick);
+        const shown = ok && pageParams(p.view)?.status === 'model';
+        p.session.shutdown();
+        return {shown, worst: Math.round(worst)};
+    };
+    const runs = [];
+    for (let i = 0; i < 3; i++) {
+        runs.push(await measure());
+        if (runs.at(-1).worst < 120)
+            break;
+    }
+    print(`# longest main-loop stall per run: ${runs.map((r) => `${r.worst} ms`).join(', ')}`);
+    check(runs.every((r) => r.shown), 'big mesh: validated and shown');
+    check(Math.min(...runs.map((r) => r.worst)) < 120, 'big mesh: the main loop kept running during validation',
+        runs.map((r) => r.worst).join(', '));
+
     const bad = source('step');
     GLib.file_set_contents(`${bad}.mode`, 'bignanmpk');
     const q = open(bad);
     await waitFor(() => settled(q), 30000);
     check(pageParams(q.view)?.status === 'error', 'big mesh with a NaN at the end: rejected', pageParams(q.view)?.message);
     q.session.shutdown();
+
+    // Closed while the big mesh is being validated: validation stops, nothing is cached.
+    const before = visible();
+    const c = source('step');
+    GLib.file_set_contents(`${c}.mode`, 'bigmpk');
+    const r = open(c);
+    await waitFor(() => runsFor(c).length === 1);
+    const {pid, out} = runsFor(c)[0];
+    await waitFor(() => !pidAlive(pid), 30000);           // converter done: validation running
+    r.session.shutdown();
+    check(await waitFor(() => !exists(out) && temps().length === 0, 3000),
+        'big mesh closed during validation: its output is removed', temps().join(','));
+    check(pageParams(r.view)?.status === 'progress' && visible().join() === before.join(),
+        'big mesh closed during validation: never shown, nothing cached');
 }
 
 // The source disappears while it converts: an error, and nothing cached or left over.

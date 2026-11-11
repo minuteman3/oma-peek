@@ -1,47 +1,62 @@
 #!/bin/bash
 # T9: acceptance in a private nested Hyprland. Starts its own Hyprland as a window of the
 # current Wayland session, then drives the real Sushi previewer (on a private session bus) and
-# the standalone viewer inside it: screenshots, and real key presses through wtype. Every
-# Wayland and Hyprland call made after start-up goes to the nested compositor, so no key ever
-# reaches the user's own windows or lock screen. The nested compositor shows up as one window.
+# the standalone viewer inside it: screenshots, and real key presses through wtype.
+#
+# Isolation from the user's session:
+# - everything runs in a fresh user + PID namespace (killed and reaped as a whole at the end)
+#   with a minimal environment: no host DISPLAY, WAYLAND_*, HYPRLAND_* or session bus;
+# - the private session bus and every client use a private runtime directory, so they can only
+#   find the nested compositor; D-Bus activated services get the nested environment too;
+# - the nested Hyprland reaches the user's compositor only as a Wayland client (one window),
+#   and is denied a seat (no DRM, no physical input): checked in its log before anything runs.
 #
 # run: XDG_DATA_HOME=<install> XDG_CACHE_HOME=<cache> FIXTURES=<dir> [CAD_FIXTURES=<dir>] bash tests/acceptance.sh
 # Exit 77 = skipped (no Wayland session to nest in, or a tool is missing).
 set -uo pipefail
 
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-# An inherited Wayland connection (WAYLAND_SOCKET) would take precedence over WAYLAND_DISPLAY
-# for every client started here; never use one.
-unset WAYLAND_SOCKET
 if [ "${1:-}" != --inner ]; then
-    for tool in Hyprland hyprctl grim wtype dbus-run-session gdbus python3; do
+    for tool in Hyprland hyprctl grim wtype dbus-run-session dbus-update-activation-environment gdbus python3 unshare; do
         command -v "$tool" >/dev/null || { echo "# skip: $tool not installed"; exit 77; }
     done
-    if [ -z "${WAYLAND_DISPLAY:-}" ]; then
-        WAYLAND_DISPLAY="$(cd "$XDG_RUNTIME_DIR" && ls wayland-* 2>/dev/null | grep -v lock | head -1)"
-        export WAYLAND_DISPLAY
-    fi
-    [ -n "$WAYLAND_DISPLAY" ] && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] ||
-        { echo "# skip: no Wayland session to nest a compositor in"; exit 77; }
-    # Private session bus: our previewer and viewer app never meet the user's real ones.
-    exec dbus-run-session -- bash "${BASH_SOURCE[0]}" --inner
+    host_runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    host_wayland="${WAYLAND_DISPLAY:-}"
+    [ -n "$host_wayland" ] ||
+        host_wayland="$(cd "$host_runtime" && ls wayland-* 2>/dev/null | grep -v lock | head -1)"
+    case "$host_wayland" in /*) ;; *) host_wayland="$host_runtime/$host_wayland" ;; esac
+    [ -S "$host_wayland" ] || { echo "# skip: no Wayland session to nest a compositor in"; exit 77; }
+    unshare --map-current-user --pid --fork --mount-proc true 2>/dev/null ||
+        { echo "# skip: unprivileged user/PID namespaces unavailable"; exit 77; }
+    # Private runtime directory (short path: Unix socket paths are limited to 108 bytes). The
+    # host socket path is handed over in a file, so it is in no process environment.
+    RUN="$(mktemp -d /tmp/opk.XXXXXX)"
+    chmod 700 "$RUN"
+    printf '%s' "$host_wayland" >"$RUN/.host-wayland"
+    exec env -i HOME="$HOME" PATH="$PATH" USER="${USER:-}" LANG="${LANG:-C.UTF-8}" \
+        TMPDIR="${TMPDIR:-/tmp}" XDG_RUNTIME_DIR="$RUN" \
+        XDG_DATA_HOME="$XDG_DATA_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+        FIXTURES="$FIXTURES" CAD_FIXTURES="${CAD_FIXTURES:-}" OMA_PEEK_KEEP="${OMA_PEEK_KEEP:-}" \
+        unshare --map-current-user --pid --fork --kill-child --mount-proc \
+        dbus-run-session -- bash "${BASH_SOURCE[0]}" --inner
 fi
 
+RUN="$XDG_RUNTIME_DIR"
+host_wayland="$(cat "$RUN/.host-wayland")"
+rm -f "$RUN/.host-wayland"
 W="$(mktemp -d "${TMPDIR:-/tmp}/oma-peek-accept-XXXXXX")"
-# The nested compositor gets its own runtime directory (short path: Unix socket paths are
-# limited to 108 bytes). Its sockets and instance files live only there, so cleanup never
-# touches anything of the user's session.
-RUN="$(mktemp -d /tmp/opk.XXXXXX)"
-chmod 700 "$RUN"
-host_display="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"   # absolute: libwayland accepts a path
-pids=()
 nested=""
+# Everything in this PID namespace is ours: stop all of it (the private bus's init process,
+# PID 1, excepted), wait until it is gone, then remove our files.
 cleanup() {
-    for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
-    if [ -n "$nested" ]; then
-        kill "$nested" 2>/dev/null
-        for _ in $(seq 50); do kill -0 "$nested" 2>/dev/null || break; pause 0.1; done
-    fi
+    trap - EXIT
+    kill -TERM -1 2>/dev/null
+    # kill -0 -1 (a builtin) succeeds while any other process we can signal is left.
+    for _ in $(seq 50); do
+        kill -0 -1 2>/dev/null || break
+        python3 -c 'import time; time.sleep(0.1)'
+    done
+    kill -KILL -1 2>/dev/null
+    while kill -0 -1 2>/dev/null; do wait 2>/dev/null; python3 -c 'import time; time.sleep(0.05)'; done
     rm -rf "$RUN"
     [ -n "${OMA_PEEK_KEEP:-}" ] && echo "# kept $W" || rm -rf "$W"
 }
@@ -56,15 +71,11 @@ pause() { python3 -c "import time; time.sleep($1)"; }
 
 # --- the nested compositor ----------------------------------------------------------------
 : >"$W/hyprland.lua"                     # defaults only: no autostart, no user bindings
-# The nested Hyprland reaches the user's compositor only as a client (one window), through
-# the absolute socket path; everything it serves is in $RUN.
-XDG_RUNTIME_DIR="$RUN" WAYLAND_DISPLAY="$host_display" \
+# Only this process is given the user's compositor socket. LIBSEAT_BACKEND names no real
+# backend, so it can't open a seat (no DRM, no physical input devices).
+LIBSEAT_BACKEND=oma-peek-no-seat WAYLAND_DISPLAY="$host_wayland" \
     Hyprland --config "$W/hyprland.lua" >"$W/hyprland.log" 2>&1 &
 nested=$!
-# From here on every client uses the private runtime directory, so it can only find the
-# nested compositor (hyprctl's instance list included).
-export XDG_RUNTIME_DIR="$RUN"
-unset WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE DISPLAY
 sig="" sock=""
 for _ in $(seq 100); do
     read -r sig sock < <(hyprctl -j instances 2>/dev/null | python3 -c '
@@ -76,11 +87,20 @@ for i in json.load(sys.stdin):
     pause 0.1
 done
 [ -n "$sig" ] && [ -S "$RUN/$sock" ] || { echo "# skip: could not start a nested Hyprland"; exit 77; }
+hlog="$RUN/hypr/$sig/hyprland.log"
+if ! { grep -q 'libseat: failed to open a seat' "$hlog" && grep -q 'Starting the Wayland backend' "$hlog" &&
+       ! grep -q 'Starting the DRM backend' "$hlog"; }; then
+    echo "not ok - nested Hyprland runs without a seat, on the Wayland backend only"
+    exit 1
+fi
+echo "ok - nested Hyprland runs without a seat, on the Wayland backend only"
 export WAYLAND_DISPLAY="$sock" HYPRLAND_INSTANCE_SIGNATURE="$sig"
+# Services the private bus starts on demand (portals, GVfs, accessibility) get the same.
+dbus-update-activation-environment XDG_RUNTIME_DIR WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE
 nested_alive() { kill -0 "$nested" 2>/dev/null; }
 nested_only() {
-    [ -z "${WAYLAND_SOCKET:-}" ] && [ "$XDG_RUNTIME_DIR" = "$RUN" ] && [ "$WAYLAND_DISPLAY" = "$sock" ] &&
-        [ "$HYPRLAND_INSTANCE_SIGNATURE" = "$sig" ] && nested_alive
+    [ -z "${WAYLAND_SOCKET:-}" ] && [ -z "${DISPLAY:-}" ] && [ "$XDG_RUNTIME_DIR" = "$RUN" ] &&
+        [ "$WAYLAND_DISPLAY" = "$sock" ] && [ "$HYPRLAND_INSTANCE_SIGNATURE" = "$sig" ] && nested_alive
 }
 timeout 10 grim "$W/probe.png" 2>/dev/null ||
     { echo "# skip: the nested compositor is not drawing (is the display asleep?)"; exit 77; }
@@ -131,6 +151,20 @@ PY
 # Hyprland 0.56+ takes Lua dispatcher calls.
 focus_window() { hyprctl dispatch "hl.dsp.focus({ window = \"address:$1\" })" >/dev/null; }
 close_window() { hyprctl dispatch "hl.dsp.window.close({ window = \"address:$1\" })" >/dev/null; }
+# Maximize a window and screenshot it once its size has settled: tiling and late resizes
+# otherwise make the captured area depend on timing.
+shown() { # shown PID ADDRESS PNG: the window's model is drawn
+    hyprctl dispatch "hl.dsp.window.fullscreen({ mode = \"maximized\", action = \"set\", window = \"address:$2\" })" >/dev/null
+    local geom prev=""
+    for _ in $(seq 20); do
+        pause 0.25
+        geom="$(clients "$1" | awk -v a="$2" '$1 == a {print $2, $3}')" || return 1
+        [ -n "$geom" ] && [ "$geom" = "$prev" ] && break
+        prev="$geom"
+    done
+    pause 0.5
+    drawn "$geom" "$3"
+}
 press() { # press ADDRESS KEY: focus the window, then type KEY (into the nested compositor only)
     nested_only || { echo "# refusing to type outside the nested compositor"; return 1; }
     focus_window "$1"
@@ -148,7 +182,6 @@ show() { # show FILE: ask our previewer to show FILE
 }
 /usr/lib/org.gnome.NautilusPreviewer >"$W/previewer.log" 2>&1 &
 sushi=$!
-pids+=("$sushi")
 gdbus wait --session --timeout 15 $PREVIEWER
 check "Sushi: our previewer owns its bus name" test "$(bus_owner_pid $PREVIEWER)" = "$sushi"
 
@@ -157,7 +190,7 @@ for key in space Escape; do
     check "Sushi ($key): preview window opens" wait_windows "$sushi" 1 || continue
     pause 2.5
     read -r addr geom < <(clients "$sushi")
-    check "Sushi ($key): model drawn" drawn "$geom" "$W/sushi-$key.png"
+    check "Sushi ($key): model drawn" shown "$sushi" "$addr" "$W/sushi-$key.png"
     check "Sushi ($key): key delivered" press "$addr" "$key" || continue
     check "Sushi: $key closes the preview" wait_windows "$sushi" 0 5
 done
@@ -166,7 +199,7 @@ if [ -n "${CAD_FIXTURES:-}" ] && [ -x "$XDG_DATA_HOME/oma-peek/oma-peek-cad" ]; 
     if check "Sushi: STEP preview opens" wait_windows "$sushi" 1; then
         pause 4
         read -r addr geom < <(clients "$sushi")
-        check "Sushi: STEP converted and drawn" drawn "$geom" "$W/sushi-step.png"
+        check "Sushi: STEP converted and drawn" shown "$sushi" "$addr" "$W/sushi-step.png"
         check "Sushi (STEP): Escape delivered" press "$addr" Escape &&
             check "Sushi: Escape closes the STEP preview" wait_windows "$sushi" 0 5
     fi
@@ -193,13 +226,12 @@ standalone() {
     "$open_cmd" "$FIXTURES/box-binary.stl" "$FIXTURES/generic.3mf"
     app="$(viewer_pid)"
     check "standalone: viewer starts on our bus" test -n "$app" || return
-    pids+=("$app")
     check "standalone: two files open two windows" wait_windows "$app" 2 || return
     "$open_cmd" "$FIXTURES/two-groups.obj"
     check "standalone: a second launch opens in the running instance" wait_windows "$app" 3 || return
     check "standalone: still one viewer process" test "$(bus_owner_pid $APP)" = "$app"
     read -r addr geom < <(clients "$app" | head -1)
-    check "standalone: model drawn" drawn "$geom" "$W/standalone.png"
+    check "standalone: model drawn" shown "$app" "$addr" "$W/standalone.png"
     check "standalone: Q delivered" press "$addr" q || return
     check "standalone: Q closes one window" wait_windows "$app" 2 5 || return
 
@@ -214,7 +246,6 @@ standalone() {
     "$open_cmd" "$W/a.step" "$W/b.step"
     app="$(viewer_pid)"
     check "standalone: viewer starts again" test -n "$app" || return
-    pids+=("$app")
     check "standalone: two converting windows open" wait_windows "$app" 2 || return
     for _ in $(seq 50); do [ "$(wc -l <"$W/conv.log" 2>/dev/null || echo 0)" -eq 2 ] && break; pause 0.1; done
     local pid_a pid_b win_a
@@ -229,7 +260,7 @@ standalone() {
     echo go >"$W/gate-b.step"
     pause 2
     read -r addr geom < <(clients "$app")
-    check "standalone: the other window shows its model" drawn "$geom" "$W/standalone-b.png"
+    check "standalone: the other window shows its model" shown "$app" "$addr" "$W/standalone-b.png"
     [ -f "$W/real-cad" ] && cp "$W/real-cad" "$XDG_DATA_HOME/oma-peek/oma-peek-cad"
     check "standalone: Escape delivered" press "$addr" Escape || return
     check "standalone: Escape closes the last window" wait_windows "$app" 0 5
