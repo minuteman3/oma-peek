@@ -91,7 +91,8 @@ export function snapshotCoverage(view, WebKit) {
 // Modes: ok, fail (exit 1 with an error), short (3 bytes), badmpk (header not JSON),
 // truncmpk (header promises triangles that are missing), nanmpk (complete but every
 // coordinate NaN), lockdir (cache dir made read-only after writing), touchsrc (edit the
-// source during the first run only), alwaystouch, rmsrc (delete the source while converting).
+// source during the first run only), alwaystouch, rmsrc (delete the source while converting),
+// bigmpk (128 MB valid mesh), bignanmpk (128 MB, only the very last coordinate NaN).
 export function installFakeConverter() {
     const path = GLib.build_filenamev([GLib.get_user_data_dir(), 'oma-peek', 'oma-peek-cad']);
     GLib.file_set_contents(path, `#!/bin/bash
@@ -114,6 +115,11 @@ case "$mode" in
   nanmpk) { printf 'MPK1\\x14\\x00\\x00\\x00{"parts":[{"n":12}]}'
             for _ in $(seq 108); do printf '\\x00\\x00\\xc0\\x7f'; done; } >"$out" ;;
   rmsrc) cat "$FAKE_MPK" >"$out"; rm -f "$src" ;;
+  bigmpk|bignanmpk)
+    n=3728270; hdr='{"parts":[{"n":'$n'}]}'; len=\${#hdr}
+    { printf "MPK1\\x$(printf %02x $((len & 255)))\\x$(printf %02x $((len >> 8 & 255)))\\x00\\x00%s" "$hdr"
+      if [ "$mode" = bigmpk ]; then head -c $((n * 36)) /dev/zero
+      else head -c $((n * 36 - 4)) /dev/zero; printf '\\x00\\x00\\xc0\\x7f'; fi; } >"$out" ;;
   lockdir) cat "$FAKE_MPK" >"$out"; chmod a-w "$(dirname "$out")" ;;
   touchsrc) cat "$FAKE_MPK" >"$out"; [ -e "$src.touched" ] || { touch "$src.touched"; echo edit >>"$src"; } ;;
   alwaystouch) cat "$FAKE_MPK" >"$out"; echo edit >>"$src" ;;

@@ -24,6 +24,9 @@ try {
 
 Gio._promisify(Gio.Subprocess.prototype, 'communicate_utf8_async', 'communicate_utf8_finish');
 Gio._promisify(Gio.Subprocess.prototype, 'wait_async', 'wait_finish');
+Gio._promisify(Gio.File.prototype, 'read_async', 'read_finish');
+Gio._promisify(Gio.InputStream.prototype, 'read_bytes_async', 'read_bytes_finish');
+Gio._promisify(Gio.InputStream.prototype, 'skip_async', 'skip_finish');
 
 const RUNTIME_DIR = GLib.build_filenamev([GLib.get_user_data_dir(), 'oma-peek']);
 const WEB_ROOT = GLib.build_filenamev([RUNTIME_DIR, 'web', 'index.html']);
@@ -211,11 +214,50 @@ function readHead(path, n) {
 }
 
 const BAD_OUTPUT = 'the converter produced no usable mesh';
+const SCAN_CHUNK = 4 << 20;
+
+// Check that `length` bytes of float32 data starting at `start` are all finite. Reads in
+// chunks asynchronously, so the previewer stays responsive (and cancellable) on big meshes.
+async function checkFiniteFloats(path, start, length, cancellable) {
+    const stream = await Gio.File.new_for_path(path).read_async(GLib.PRIORITY_DEFAULT, cancellable);
+    try {
+        for (let skipped = 0; skipped < start;) {
+            const n = await stream.skip_async(start - skipped, GLib.PRIORITY_DEFAULT, cancellable);
+            if (n <= 0)
+                throw new Error(BAD_OUTPUT);
+            skipped += n;
+        }
+        let remaining = length;
+        let carry = new Uint8Array(0);
+        while (remaining > 0) {
+            const chunk = (await stream.read_bytes_async(Math.min(SCAN_CHUNK, remaining),
+                GLib.PRIORITY_DEFAULT, cancellable)).toArray();
+            if (!chunk.length)
+                throw new Error(BAD_OUTPUT);
+            remaining -= chunk.length;
+            let buf = chunk;
+            if (carry.length) {
+                buf = new Uint8Array(carry.length + chunk.length);
+                buf.set(carry);
+                buf.set(chunk, carry.length);
+            }
+            const whole = buf.length - (buf.length % 4);
+            const dv = new DataView(buf.buffer, buf.byteOffset, whole);
+            for (let off = 0; off < whole; off += 4) {
+                if (!Number.isFinite(dv.getFloat32(off, true)))
+                    throw new Error(BAD_OUTPUT);
+            }
+            carry = buf.slice(whole);
+        }
+    } finally {
+        stream.close(null);
+    }
+}
 
 // Converter output must be complete before it is shown or cached. STL: a binary STL whose
 // size matches its triangle count, or ASCII. MPK: magic, a JSON header listing parts with
 // triangle counts, and exactly that many triangles (9 finite float32 each) after it.
-function validateOutput(path, outExt) {
+async function validateOutput(path, outExt, cancellable) {
     const size = Gio.File.new_for_path(path).query_info('standard::size', Gio.FileQueryInfoFlags.NONE, null).get_size();
     const head = readHead(path, 84);
     const dv = new DataView(head.buffer, head.byteOffset, head.byteLength);
@@ -244,12 +286,7 @@ function validateOutput(path, outExt) {
     if (size !== 8 + len + triangles * 36)
         throw new Error(BAD_OUTPUT);
     // Every coordinate must be a finite number (the viewer rejects NaN and infinities).
-    const [, bytes] = Gio.File.new_for_path(path).load_contents(null);
-    const body = new DataView(bytes.buffer, bytes.byteOffset + 8 + len, triangles * 36);
-    for (let off = 0; off < body.byteLength; off += 4) {
-        if (!Number.isFinite(body.getFloat32(off, true)))
-            throw new Error(BAD_OUTPUT);
-    }
+    await checkFiniteFloats(path, 8 + len, triangles * 36, cancellable);
 }
 
 // Resolves to {path, temporary}; temporary outputs belong to the caller.
@@ -271,7 +308,7 @@ async function convert(file, conversion, cancellable, attempts = 2) {
     let changed = false;
     try {
         await runConverter(conversion.argv(tmp), cancellable);
-        validateOutput(tmp, conversion.outExt);
+        await validateOutput(tmp, conversion.outExt, cancellable);
         // Edited while converting: the output may mix old and new content.
         changed = sourceIdentity(file) !== identity;
         if (changed) {

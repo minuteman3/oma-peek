@@ -174,6 +174,33 @@ for (const mode of ['short', 'badmpk', 'truncmpk', 'nanmpk']) {
     q.session.shutdown();
 }
 
+// A big mesh is validated without blocking the main loop (the previewer must stay able to
+// close or switch previews), and a NaN in its very last coordinate is still found.
+{
+    let last = Date.now(), worst = 0;
+    const tick = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 10, () => {
+        const now = Date.now();
+        worst = Math.max(worst, now - last);
+        last = now;
+        return GLib.SOURCE_CONTINUE;
+    });
+    const big = source('step');
+    GLib.file_set_contents(`${big}.mode`, 'bigmpk');
+    const p = open(big);
+    await waitFor(() => settled(p), 30000);
+    GLib.source_remove(tick);
+    check(pageParams(p.view)?.status === 'model', 'big mesh: validated and shown', pageParams(p.view)?.message);
+    print(`# longest main-loop stall: ${worst} ms`);
+    check(worst < 120, 'big mesh: the main loop kept running during validation', `longest stall ${worst} ms`);
+    p.session.shutdown();
+    const bad = source('step');
+    GLib.file_set_contents(`${bad}.mode`, 'bignanmpk');
+    const q = open(bad);
+    await waitFor(() => settled(q), 30000);
+    check(pageParams(q.view)?.status === 'error', 'big mesh with a NaN at the end: rejected', pageParams(q.view)?.message);
+    q.session.shutdown();
+}
+
 // The source disappears while it converts: an error, and nothing cached or left over.
 {
     const before = visible();
