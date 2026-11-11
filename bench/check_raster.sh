@@ -1,10 +1,15 @@
 #!/bin/bash
-# raster.c unit correctness vs bench/ref (from the raster track), then a thumbnailer smoke test.
+# raster.c unit correctness vs bench/ref (from the raster track).
+# bench/data and bench/ref are local reference captures (gitignored); without them this skips.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-gcc $(cat cflags) -o bench/bench bench/bench.c raster.c $(cat ldlibs)
+if [ ! -d bench/data ] || [ ! -d bench/ref ]; then
+    echo "# skip: bench/data and bench/ref are not present (local reference captures)"
+    exit 77
+fi
 out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
-./bench/bench bench/data "$out" >/dev/null
+gcc $(cat cflags) -o "$out/bench" bench/bench.c raster.c $(cat ldlibs)
+"$out/bench" bench/data "$out" >/dev/null
 python3 -I - "$out" bench/ref <<'PY'
 import sys, numpy as np
 out, ref = sys.argv[1], sys.argv[2]
@@ -27,9 +32,5 @@ for c in range(2):
         print(f'mesh{c}: vertex rel err {err.max()}'); ok = False
 sys.exit(0 if ok else 1)
 PY
-# End-to-end: thumbnailer with this library.
-gcc $(cat cflags) -shared -s -o libmeshraster.so raster.c -lm -lpthread
-python3 -I thumbnailer.py bench/e2e/data/typical.3mf "$out/a.png" 256
-python3 -I thumbnailer.py bench/e2e/data/small.stl "$out/b.png" 128
-python3 -I -c "from PIL import Image; import sys; [Image.open(p).verify() for p in sys.argv[1:]]" "$out/a.png" "$out/b.png"
+# Thumbnailer end-to-end coverage lives in tests/thumbnailer.test.js (real thumbnail factory).
 echo checks ok
