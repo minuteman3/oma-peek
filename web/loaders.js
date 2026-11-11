@@ -104,6 +104,7 @@ function loadSTL(bytes) {
         const out = [];
         for (const m of text.matchAll(/vertex\s+(\S+)\s+(\S+)\s+(\S+)/g))
             out.push(+m[1], +m[2], +m[3]);
+        if (out.length % 9) throw new Error('malformed STL: incomplete triangle');
         positions = Float32Array.from(out);
     }
     const indices = new Uint32Array(positions.length / 3);
@@ -530,10 +531,23 @@ function loadMPK(bytes) {
     return { yUp: false, plates: [{ name: 'Model' }], parts };
 }
 
+// Every loader's result passes through here: parts without triangles are dropped, and a model
+// with no triangles left, or with non-finite coordinates, is an error rather than an empty view.
+function validate(model) {
+    model.parts = model.parts.filter((p) => p.indices.length >= 3);
+    if (!model.parts.length) throw new Error('This file contains no geometry.');
+    for (const p of model.parts) {
+        if (p.indices.length % 3) throw new Error('malformed model: incomplete triangle');
+        for (let i = 0; i < p.positions.length; i++)
+            if (!Number.isFinite(p.positions[i])) throw new Error('malformed model: non-finite coordinate');
+    }
+    return model;
+}
+
 export async function loadModel(bytes, ext, fetchSibling) {
     ext = ext.toLowerCase();
-    if (ext === 'mpk') return loadMPK(bytes);
-    if (ext === '3mf') return load3MF(bytes);
-    if (ext === 'obj') return loadOBJ(bytes, fetchSibling);
-    return loadSTL(bytes);
+    if (ext === 'mpk') return validate(loadMPK(bytes));
+    if (ext === '3mf') return validate(load3MF(bytes));
+    if (ext === 'obj') return validate(await loadOBJ(bytes, fetchSibling));
+    return validate(loadSTL(bytes));
 }

@@ -1,10 +1,24 @@
 import * as THREE from 'three';
 import { OrbitControls } from './vendor/OrbitControls.js';
 import { loadModel } from './loaders.js';
+import { initialState, reduce, isVisible, onPlate } from './state.js';
 
+// Host -> page (query string): status=progress|error|model, message, file, ext, name, theme.
+// Page -> host: one 'ready' message once the page shows something (progress or error text,
+// or the model), via the WebKit script message handler 'omaPeek' when the host registered it.
 const params = new URLSearchParams(location.search);
 const filePath = params.get('file');
+const status = params.get('status') || (filePath ? 'model' : 'error');
 const ext = (params.get('ext') || (filePath || '').split('.').pop()).toLowerCase();
+
+let readyPosted = false;
+function postReady(outcome) {
+    if (readyPosted) return;
+    readyPosted = true;
+    try {
+        window.webkit?.messageHandlers?.omaPeek?.postMessage(JSON.stringify({ event: 'ready', outcome }));
+    } catch (e) { /* not hosted by oma-peek (e.g. opened in a browser) */ }
+}
 
 const $ = (id) => document.getElementById(id);
 const msg = $('msg'), info = $('info'), side = $('side'), view = $('view');
@@ -20,10 +34,15 @@ for (const [v, k] of Object.entries(themeMap)) if (theme[k]) css.setProperty('--
 const accent = new THREE.Color(theme.accent || '#f38d70');
 const defaultColour = theme.mode === 'light' ? '#9aa3ad' : '#b9c0c8';
 
-function fail(text) {
+function show(text, kind) {
     msg.textContent = text;
-    msg.className = 'error';
+    msg.className = kind === 'error' ? 'error' : '';
     msg.hidden = false;
+}
+
+function fail(text) {
+    show(text, 'error');
+    postReady('error');
 }
 
 // Dark filament (black, navy…) would vanish on a dark background; lift it a little.
@@ -37,29 +56,41 @@ function displayColour(hex) {
 
 // --- scene ---------------------------------------------------------------------
 
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-renderer.setPixelRatio(window.devicePixelRatio);
-view.prepend(renderer.domElement);
-
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 100000);
-scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.6));
-const key = new THREE.DirectionalLight(0xffffff, 1.6);
-key.position.set(0.6, 1.2, 0.9);
-camera.add(key);
-const fill = new THREE.DirectionalLight(0xffffff, 0.5);
-fill.position.set(-1, -0.3, 0.4);
-camera.add(fill);
-scene.add(camera);
-
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.12;
-controls.screenSpacePanning = true;
-
-const root = new THREE.Group();
-scene.add(root);
+// Created by initScene() only when there is a model to show, so progress and error pages
+// work without WebGL.
+let renderer, scene, camera, controls, root;
 let grid = null;
+
+function initScene() {
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    view.prepend(renderer.domElement);
+
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(30, 1, 0.1, 100000);
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.6));
+    const key = new THREE.DirectionalLight(0xffffff, 1.6);
+    key.position.set(0.6, 1.2, 0.9);
+    camera.add(key);
+    const fill = new THREE.DirectionalLight(0xffffff, 0.5);
+    fill.position.set(-1, -0.3, 0.4);
+    camera.add(fill);
+    scene.add(camera);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.12;
+    controls.screenSpacePanning = true;
+
+    root = new THREE.Group();
+    scene.add(root);
+
+    new ResizeObserver(() => { resize(); if (meshes.length) frame(visibleMeshes()); }).observe(view);
+    renderer.setAnimationLoop(() => {
+        controls.update();
+        renderer.render(scene, camera);
+    });
+}
 
 const DEFAULT_DIR = new THREE.Vector3(0.75, 0.62, 1.05).normalize();
 
@@ -117,7 +148,7 @@ function frame(objects, keepDirection = true) {
 
 function resize() {
     const w = view.clientWidth, h = view.clientHeight;
-    if (!w || !h) return;
+    if (!renderer || !w || !h) return;
     renderer.setSize(w, h, false);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
@@ -155,20 +186,29 @@ function buildMesh(part) {
     return mesh;
 }
 
-let model, meshes = [], plate = -1, isolated = null;
+let model, meshes = [], state;
 
 function visibleMeshes() {
     return meshes.filter((m) => m.visible);
 }
 
 function applyVisibility(keepDirection = true) {
-    for (const m of meshes) {
-        const p = m.userData.part;
-        m.visible = isolated ? m === isolated : (plate < 0 || p.plate === plate);
-    }
+    meshes.forEach((m, i) => { m.visible = isVisible(model, state, i); });
     frame(visibleMeshes(), keepDirection);
     updateInfo();
     renderSidebar();
+}
+
+// All view-state changes go through here (web/state.js owns the rules).
+function dispatch(action) {
+    const prev = state;
+    state = reduce(model, state, action);
+    if (state === prev) return;
+    if (prev.hovered !== state.hovered) {
+        if (prev.hovered !== null) highlight(meshes[prev.hovered], false);
+        if (state.hovered !== null) highlight(meshes[state.hovered], true);
+    }
+    if (prev.plate !== state.plate || prev.isolated !== state.isolated) applyVisibility();
 }
 
 function updateInfo() {
@@ -232,14 +272,14 @@ function renderSidebar() {
         h.textContent = 'Plates';
         side.append(h);
         side.append(button('All plates', {
-            count: meshes.length, active: plate < 0 && !isolated,
-            onClick: () => { plate = -1; isolated = null; applyVisibility(); },
+            count: meshes.length, active: state.plate < 0 && state.isolated === null,
+            onClick: () => dispatch({ type: 'selectPlate', plate: -1 }),
         }));
         plates.forEach((p, i) => {
             const n = meshes.filter((m) => m.userData.part.plate === i).length;
             side.append(button(p.name, {
-                count: n, active: plate === i && !isolated,
-                onClick: () => { plate = i; isolated = null; applyVisibility(); },
+                count: n, active: state.plate === i && state.isolated === null,
+                onClick: () => dispatch({ type: 'selectPlate', plate: i }),
             }));
         });
     }
@@ -248,17 +288,17 @@ function renderSidebar() {
         const h = document.createElement('h2');
         h.textContent = 'Objects';
         side.append(h);
-        for (const m of meshes) {
+        meshes.forEach((m, i) => {
             const p = m.userData.part;
-            if (plate >= 0 && p.plate !== plate) continue;
+            if (!onPlate(model, state, i)) return;
             const c = p.triColors ? 'conic-from-colors' : '#' + displayColour(p.color).getHexString();
             side.append(button(p.name || 'Object', {
                 dot: c === 'conic-from-colors' ? 'conic-gradient(#f38d70,#85dacc,#a8a9eb,#f9cc6c,#f38d70)' : c,
-                active: isolated === m, dim: isolated && isolated !== m,
-                onClick: () => { isolated = isolated === m ? null : m; highlight(m, false); applyVisibility(); },
-                onHover: (on) => { if (!isolated) highlight(m, on); },
+                active: state.isolated === i, dim: state.isolated !== null && state.isolated !== i,
+                onClick: () => dispatch({ type: 'toggleIsolate', part: i }),
+                onHover: (on) => dispatch({ type: 'hover', part: i, on }),
             }));
-        }
+        });
     }
     requestAnimationFrame(resize);
 }
@@ -273,10 +313,17 @@ async function readFile(path) {
 }
 
 async function main() {
-    resize();
-    if (!filePath) {
-        msg.textContent = params.get('message') || 'Nothing to show';
-        if (!/…$/.test(msg.textContent)) msg.className = 'error';
+    if (status !== 'model' || !filePath) {
+        const kind = status === 'progress' ? 'progress' : 'error';
+        show(params.get('message') || 'Nothing to show', kind);
+        postReady(kind);
+        return;
+    }
+    try {
+        initScene();
+        resize();
+    } catch (e) {
+        fail(`3D view unavailable: WebGL could not start\n${e.message}`);
         return;
     }
     let bytes;
@@ -293,32 +340,30 @@ async function main() {
         fail(`Could not parse this file\n${e.message}`);
         return;
     }
-    if (!model.parts.length) { fail('This file contains no geometry.'); return; }
-
-    if (!model.yUp) root.rotation.x = -Math.PI / 2;
-    meshes = model.parts.map(buildMesh);
-    root.add(...meshes);
-    root.updateMatrixWorld(true);
+    try {
+        if (!model.yUp) root.rotation.x = -Math.PI / 2;
+        meshes = model.parts.map(buildMesh);
+        root.add(...meshes);
+        root.updateMatrixWorld(true);
+        state = initialState(model);
+        applyVisibility(false);
+    } catch (e) {
+        meshes = [];
+        fail(`Could not display this file\n${e.message}`);
+        return;
+    }
     msg.hidden = true;
-    plate = model.plates.length > 1 ? 0 : -1;
-    applyVisibility(false);
+    postReady('shown');
 }
 
-new ResizeObserver(() => { resize(); if (meshes.length) frame(visibleMeshes()); }).observe(view);
-
 window.addEventListener('keydown', (e) => {
-    if (e.ctrlKey || e.altKey || e.metaKey || !model) return;
+    if (e.ctrlKey || e.altKey || e.metaKey || !state) return;
     if (e.key === 'r' || e.key === 'R') {
         frame(visibleMeshes(), false);
     } else if (/^[0-9]$/.test(e.key) && model.plates.length > 1) {
-        const i = +e.key - 1;
-        if (i < model.plates.length) { plate = i; isolated = null; applyVisibility(); }
+        // 1-9 pick a plate, 0 shows all plates.
+        dispatch({ type: 'selectPlate', plate: +e.key - 1 });
     }
 });
 
-renderer.setAnimationLoop(() => {
-    controls.update();
-    renderer.render(scene, camera);
-});
-
-main();
+main().catch((e) => fail(`Unexpected error\n${e.message}`));
