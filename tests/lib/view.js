@@ -89,8 +89,9 @@ export function snapshotCoverage(view, WebKit) {
 //   FAKE_GATES  directory: write a partial output, log, then block on the FIFO
 //               FAKE_GATES/<pid> (bash's own redirection, so killing the converter unblocks it)
 // Modes: ok, fail (exit 1 with an error), short (3 bytes), badmpk (header not JSON),
-// truncmpk (header promises triangles that are missing), lockdir (cache dir made read-only
-// after writing), touchsrc (edit the source during the first run only), alwaystouch.
+// truncmpk (header promises triangles that are missing), nanmpk (complete but every
+// coordinate NaN), lockdir (cache dir made read-only after writing), touchsrc (edit the
+// source during the first run only), alwaystouch, rmsrc (delete the source while converting).
 export function installFakeConverter() {
     const path = GLib.build_filenamev([GLib.get_user_data_dir(), 'oma-peek', 'oma-peek-cad']);
     GLib.file_set_contents(path, `#!/bin/bash
@@ -110,6 +111,9 @@ case "$mode" in
   short) printf abc >"$out" ;;
   badmpk) printf 'MPK1\\x05\\x00\\x00\\x00{bad}' >"$out" ;;
   truncmpk) printf 'MPK1\\x14\\x00\\x00\\x00{"parts":[{"n":12}]}' >"$out" ;;
+  nanmpk) { printf 'MPK1\\x14\\x00\\x00\\x00{"parts":[{"n":12}]}'
+            for _ in $(seq 108); do printf '\\x00\\x00\\xc0\\x7f'; done; } >"$out" ;;
+  rmsrc) cat "$FAKE_MPK" >"$out"; rm -f "$src" ;;
   lockdir) cat "$FAKE_MPK" >"$out"; chmod a-w "$(dirname "$out")" ;;
   touchsrc) cat "$FAKE_MPK" >"$out"; [ -e "$src.touched" ] || { touch "$src.touched"; echo edit >>"$src"; } ;;
   alwaystouch) cat "$FAKE_MPK" >"$out"; echo edit >>"$src" ;;

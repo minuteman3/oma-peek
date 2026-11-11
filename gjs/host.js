@@ -214,7 +214,7 @@ const BAD_OUTPUT = 'the converter produced no usable mesh';
 
 // Converter output must be complete before it is shown or cached. STL: a binary STL whose
 // size matches its triangle count, or ASCII. MPK: magic, a JSON header listing parts with
-// triangle counts, and exactly that many triangles (9 float32 each) after it.
+// triangle counts, and exactly that many triangles (9 finite float32 each) after it.
 function validateOutput(path, outExt) {
     const size = Gio.File.new_for_path(path).query_info('standard::size', Gio.FileQueryInfoFlags.NONE, null).get_size();
     const head = readHead(path, 84);
@@ -243,6 +243,13 @@ function validateOutput(path, outExt) {
     const triangles = parts.reduce((t, p) => t + p.n, 0);
     if (size !== 8 + len + triangles * 36)
         throw new Error(BAD_OUTPUT);
+    // Every coordinate must be a finite number (the viewer rejects NaN and infinities).
+    const [, bytes] = Gio.File.new_for_path(path).load_contents(null);
+    const body = new DataView(bytes.buffer, bytes.byteOffset + 8 + len, triangles * 36);
+    for (let off = 0; off < body.byteLength; off += 4) {
+        if (!Number.isFinite(body.getFloat32(off, true)))
+            throw new Error(BAD_OUTPUT);
+    }
 }
 
 // Resolves to {path, temporary}; temporary outputs belong to the caller.

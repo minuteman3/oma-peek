@@ -115,7 +115,7 @@ function isMpk(path) {
 }
 
 // Converter output that isn't a complete mesh is an error and is not cached.
-for (const mode of ['short', 'badmpk', 'truncmpk']) {
+for (const mode of ['short', 'badmpk', 'truncmpk', 'nanmpk']) {
     const src = source('step');
     const before = visible().length;
     const p = open(src, {FAKE_MODE: mode});
@@ -172,6 +172,19 @@ for (const mode of ['short', 'badmpk', 'truncmpk']) {
     check(runsFor(src2).length === 2 && visible().join() === before.join() && temps().length === 0,
         'always changing: nothing cached or left over');
     q.session.shutdown();
+}
+
+// The source disappears while it converts: an error, and nothing cached or left over.
+{
+    const before = visible();
+    const src = source('step');
+    GLib.file_set_contents(`${src}.mode`, 'rmsrc');
+    const p = open(src);
+    await waitFor(() => settled(p));
+    check(pageParams(p.view)?.status === 'error', 'source removed while converting: error shown', pageParams(p.view)?.message);
+    check(visible().join() === before.join() && temps().length === 0, 'source removed while converting: nothing cached or left over',
+        temps().join(','));
+    p.session.shutdown();
 }
 
 // Cache hits and invalidation. Each change below alters exactly one part of the identity.

@@ -234,7 +234,9 @@ def raw(name, data):
 raw('bad-header.mpk', b'MPK1' + struct.pack('<I', 5) + b'{bad}')
 head = json.dumps({'parts': [{'name': 'Body', 'color': None, 'n': 12}]}).encode()
 raw('truncated.mpk', b'MPK1' + struct.pack('<I', len(head)) + head + b'\0' * 36)
+raw('nan.mpk', b'MPK1' + struct.pack('<I', len(head)) + head + struct.pack('<f', math.nan) * 108)
 cases += [
+    {'file': 'nan.mpk', 'ext': 'mpk', 'error': 'non-finite'},
     {'file': 'bad-header.mpk', 'ext': 'mpk', 'error': 'malformed mpk'},
     {'file': 'truncated.mpk', 'ext': 'mpk', 'error': 'malformed mpk'},
 ]

@@ -133,6 +133,26 @@ function close(r) {
     check(pageParams(r)?.status !== 'model', 'stopped during conversion: model page never loaded');
 }
 {
+    // A healthy preview that waits longer than the page start-up timeout (a slow conversion
+    // behind the progress page) must not be failed; the model page then loads normally.
+    GLib.setenv('FAKE_GATES', `${scratch}/gates`, true);
+    const step = `${scratch}/slow.step`;
+    GLib.file_set_contents(step, 'ISO-10303-21; slow');
+    const r = open(step);
+    GLib.unsetenv('FAKE_GATES');
+    await waitFor(() => fakeLog().some((l) => l.src === step));
+    await sleep(7000);
+    check(r.failure === null && r.readyCount === 1, 'slow conversion: progress page stays up, not failed',
+        r.failure?.message);
+    const {pid} = fakeLog().find((l) => l.src === step);
+    GLib.spawn_command_line_async(`sh -c ${GLib.shell_quote(`echo go > ${GLib.shell_quote(`${scratch}/gates/${pid}`)}`)}`);
+    let st = null;
+    check(await waitFor(async () => (st = await pageState(r).catch(() => null))?.msgHidden && /triangles/.test(st.info), 10000),
+        'slow conversion: model shown afterwards', JSON.stringify(st));
+    check(r.failure === null && r.readyCount === 1, 'slow conversion: still ready exactly once, no failure');
+    close(r);
+}
+{
     // A viewer page whose script never starts (here: a module with a syntax error) fails the
     // preview instead of showing "Loading…" forever. Runs last: it breaks the installed page.
     const state = `${data}/oma-peek/web/state.js`;
