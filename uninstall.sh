@@ -13,6 +13,8 @@
 #         shell.json missing or unreadable                                         -> keep
 #         manual install (no record from install.sh --managed)                     -> keep
 #       The state is read under the install lock, so a re-enable racing with it wins.
+#   uninstall.sh --service-stopped
+#       what the Omarchy plugin runs when the shell drops it: --if-inactive --after 3.
 set -euo pipefail
 data="${XDG_DATA_HOME:-$HOME/.local/share}"
 lock="${XDG_STATE_HOME:-$HOME/.local/state}/oma-peek/install.lock"
@@ -21,8 +23,9 @@ if_inactive=0 after=0
 while (($#)); do
     case "$1" in
     --if-inactive) if_inactive=1 ;;
+    --service-stopped) if_inactive=1 after=3 ;;
     --after) after="$2"; shift ;;
-    *) echo "usage: uninstall.sh [--if-inactive [--after SECONDS]]" >&2; exit 2 ;;
+    *) echo "usage: uninstall.sh [--service-stopped | --if-inactive [--after SECONDS]]" >&2; exit 2 ;;
     esac
     shift
 done

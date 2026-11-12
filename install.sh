@@ -16,6 +16,10 @@
 #   install.sh --managed        installed by the Omarchy plugin (Service.qml): the previews then
 #                               follow the plugin, and are removed when it is disabled or removed
 #                               (uninstall.sh --if-inactive); without it the install is manual
+#   install.sh --service        what the Omarchy plugin runs when the shell starts it:
+#                               --if-changed --notify --managed. Service.qml only ever passes this,
+#                               so what it means can change here (the shell may run a stale copy of
+#                               Service.qml after a plugin update until it restarts)
 #   install.sh --uninstall      remove everything installed above
 #   install.sh --payload FILE   only write the thumbnailer's python -c code to FILE (benchmarks)
 #
@@ -45,9 +49,10 @@ while (($#)); do
     --if-changed) if_changed=1 ;;
     --notify) notify=1 ;;
     --managed) managed=1 ;;
+    --service) if_changed=1 notify=1 managed=1 ;;
     --uninstall) exec "$here/uninstall.sh" ;;
     --payload) payload_file="$2"; shift ;;
-    *) echo "usage: install.sh [--if-changed] [--notify] [--managed] [--uninstall] [--payload FILE]" >&2; exit 2 ;;
+    *) echo "usage: install.sh [--service | --if-changed --notify --managed] [--uninstall] [--payload FILE]" >&2; exit 2 ;;
     esac
     shift
 done
