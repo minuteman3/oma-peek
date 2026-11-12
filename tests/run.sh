@@ -111,6 +111,7 @@ fi
 
 # --- system tier ------------------------------------------------------------------------------
 run_test system "installer (T7, T7r)" bash "$repo/tests/install.test.sh"
+run_test system "plugin lifecycle (T11)" bash "$repo/tests/lifecycle.test.sh"
 if ((namespaces)); then
     run_test system "thumbnailer (T6)" with_install thumb gjs -m "$repo/tests/thumbnailer.test.js"
     if [ -d "$R/noocct" ]; then

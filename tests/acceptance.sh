@@ -289,4 +289,62 @@ standalone() {
 }
 standalone
 
+# --- plugin lifecycle under Quickshell (Omarchy's shell runtime) ---------------------------
+# A minimal Quickshell shell loads the plugin's real Service.qml and unloads it the way
+# Omarchy's shell drops a service (plugin disabled or removed, or the shell restarting); the
+# Omarchy config (shell.json) says which of those it is. Runs last: it replaces the install.
+lifecycle() {
+    local repo plugin qsdir qpid cfg record data="$XDG_DATA_HOME"
+    repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    plugin="$W/plugins/minuteman3.oma-peek"
+    mkdir -p "$plugin"
+    (cd "$repo" && cp -r install.sh uninstall.sh raster.c cad.cpp thumbnailer.py cflags ldlibs cad_ldlibs \
+        manifest.json Service.qml sushi gjs strata web "$plugin/")
+    cfg="$XDG_CONFIG_HOME/omarchy/shell.json"
+    mkdir -p "$(dirname "$cfg")"
+    local enabled='{"plugins":[{"id":"minuteman3.oma-peek"}]}'
+    printf '%s' "$enabled" >"$cfg"
+    qsdir="$W/qs"
+    mkdir -p "$qsdir"
+    cat >"$qsdir/shell.qml" <<QML
+import QtQuick
+import Quickshell
+import Quickshell.Io
+ShellRoot {
+    Loader { id: svc; active: true; source: "file://$plugin/Service.qml" }
+    IpcHandler {
+        target: "omapeektest"
+        function load(): string { svc.active = true; return "ok" }
+        function unload(): string { svc.active = false; return "ok" }
+    }
+}
+QML
+    record="$data/oma-peek/.managed"
+    present() { [ -f "$data/sushi/plugins-1/oma-peek.js" ] && [ -f "$data/thumbnailers/oma-peek.thumbnailer" ]; }
+    gone() { [ ! -e "$data/sushi/plugins-1/oma-peek.js" ] && [ ! -e "$data/thumbnailers/oma-peek.thumbnailer" ] &&
+        [ ! -e "$data/oma-peek" ]; }
+    wait_until() { local t="$1"; shift; for _ in $(seq $((t * 10))); do "$@" && return 0; pause 0.1; done; return 1; }
+    managed_install() { [ -f "$record" ] && grep -q "$plugin" "$record" && [ -s "$data/oma-peek/.installed" ] && present; }
+    ipc() { quickshell ipc --pid "$qpid" call omapeektest "$1" >/dev/null 2>&1; }
+
+    quickshell -p "$qsdir" >"$W/quickshell.log" 2>&1 &
+    qpid=$!
+    check "lifecycle: service start installs the previews as managed by the plugin" wait_until 90 managed_install || return
+    check "lifecycle: unload (shell restart) delivered" ipc unload || return
+    pause 6
+    check "lifecycle: plugin still enabled -> previews kept" present
+    ipc load
+    wait_until 30 managed_install
+    printf '%s' '{"plugins":[]}' >"$cfg"
+    ipc unload
+    check "lifecycle: plugin disabled -> previews removed" wait_until 20 gone
+    printf '%s' "$enabled" >"$cfg"
+    ipc load
+    check "lifecycle: plugin enabled again -> previews reinstalled" wait_until 90 managed_install || return
+    rm -rf "$plugin"
+    ipc unload
+    check "lifecycle: plugin folder removed -> previews removed" wait_until 20 gone
+}
+if command -v quickshell >/dev/null; then lifecycle; else echo "# skip: lifecycle (quickshell not installed)"; fi
+
 exit $((fails ? 1 : 0))

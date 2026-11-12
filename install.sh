@@ -13,6 +13,9 @@
 #   install.sh                  build and install
 #   install.sh --if-changed     same, but do nothing if this source is already installed
 #   install.sh --notify         also send a desktop notification on install / failure
+#   install.sh --managed        installed by the Omarchy plugin (Service.qml): the previews then
+#                               follow the plugin, and are removed when it is disabled or removed
+#                               (uninstall.sh --if-inactive); without it the install is manual
 #   install.sh --uninstall      remove everything installed above
 #   install.sh --payload FILE   only write the thumbnailer's python -c code to FILE (benchmarks)
 #
@@ -36,14 +39,15 @@ strata_config="${XDG_CONFIG_HOME:-$HOME/.config}/strata"
 build="${XDG_CACHE_HOME:-$HOME/.cache}/oma-peek/build"
 lock="${XDG_STATE_HOME:-$HOME/.local/state}/oma-peek/install.lock"
 
-if_changed=0 notify=0 payload_file=""
+if_changed=0 notify=0 managed=0 payload_file=""
 while (($#)); do
     case "$1" in
     --if-changed) if_changed=1 ;;
     --notify) notify=1 ;;
+    --managed) managed=1 ;;
     --uninstall) exec "$here/uninstall.sh" ;;
     --payload) payload_file="$2"; shift ;;
-    *) echo "usage: install.sh [--if-changed] [--notify] [--uninstall] [--payload FILE]" >&2; exit 2 ;;
+    *) echo "usage: install.sh [--if-changed] [--notify] [--managed] [--uninstall] [--payload FILE]" >&2; exit 2 ;;
     esac
     shift
 done
@@ -70,6 +74,7 @@ fingerprint() {
     printf 'occt %s\n' "$(readlink -f /usr/lib/libTKernel.so 2>/dev/null || echo none)"
     printf 'webkit6 %s\n' "$([ -e /usr/lib/girepository-1.0/WebKit-6.0.typelib ] && echo yes || echo no)"
     printf 'strata %s\n' "$({ command -v strata >/dev/null || [ -d "$strata_config" ]; } && echo yes || echo no)"
+    printf 'managed %s %s\n' "$managed" "$( ((managed)) && echo "$here" || true)"
 }
 fingerprint_id() { fingerprint | sha1sum | cut -d' ' -f1; }
 
@@ -167,6 +172,18 @@ install -m644 "$here/sushi/oma-peek.js" "$plugins/oma-peek.js.new"
 mv "$plugins/oma-peek.js.new" "$plugins/oma-peek.js"
 # Sushi 50 and older read viewers/; this release needs Sushi 51 (GTK4), so drop the old module.
 rm -f "$legacy_viewer"
+
+# Installed by the Omarchy plugin: record which plugin and which shell config decide whether
+# it is still wanted (read by uninstall.sh --if-inactive). A manual install has no record.
+if ((managed)); then
+    python3 -I - "$here/manifest.json" "$here" "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json" \
+        "$runtime/.managed" <<'PY'
+import json, sys
+manifest, plugin_dir, shell_config, dest = sys.argv[1:]
+plugin_id = json.load(open(manifest))['id']
+json.dump({'plugin_id': plugin_id, 'plugin_dir': plugin_dir, 'shell_config': shell_config}, open(dest, 'w'))
+PY
+fi
 
 # Strata has no preview plugins, so oma-peek joins its file menu as a custom action that
 # opens the viewer in its own window. Strata reads actions from disk when it builds a menu.

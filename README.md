@@ -114,10 +114,12 @@ rm -rf ~/.cache/thumbnails/{normal,large,x-large,xx-large}/*
 
 ```sh
 omarchy plugin remove minuteman3.oma-peek
-~/.local/share/oma-peek/uninstall.sh
 ```
 
-Removing the plugin leaves the installed previews in place, so run `uninstall.sh` too.
+The previews follow the plugin: disabling or removing it removes the thumbnailer, the
+spacebar preview and their files a few seconds later, and enabling it again reinstalls them.
+A shell restart leaves them alone. An install made by running `./install.sh` yourself is not
+tied to the plugin; remove it with `~/.local/share/oma-peek/uninstall.sh`.
 
 ## How it works
 
