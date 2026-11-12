@@ -89,27 +89,62 @@ class Accum {
 
 // --- STL -------------------------------------------------------------------
 
+// Binary or ASCII? The same rule is in raster.c (stl_records) and thumbnailer.py (stl_records):
+//   size == 84 + 50*n, n > 0              binary, n records
+//   a NUL byte in the first 20 records    binary, as many whole records as the header promises
+//                                         and the file holds (header 0: all of them); fewer
+//                                         than promised -> truncated (warning)
+//   text with facet/vertex/endsolid       ASCII
+//   anything else (plain text...)         no geometry
+// Binary records always contain NUL bytes in practice (zero normals and attributes, small
+// floats); text never does, so a text file is never read as binary.
+const STL_PROBE = 4096;
+
+function stlLooksAscii(bytes) {
+    const head = bytes.subarray(0, Math.min(bytes.length, STL_PROBE));
+    if (head.includes(0)) return false;
+    return /\b(facet|vertex|endsolid)\b/.test(new TextDecoder().decode(head));
+}
+
+// -> { records, promised } for a binary STL, or null if the bytes aren't one.
+function stlBinaryRecords(bytes) {
+    if (bytes.byteLength < 84 + 50) return null;
+    const promised = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(80, true);
+    const available = Math.floor((bytes.byteLength - 84) / 50);
+    if (promised > 0 && bytes.byteLength === 84 + 50 * promised) return { records: promised, promised };
+    if (!bytes.subarray(84, Math.min(bytes.byteLength, 84 + 50 * 20)).includes(0)) return null;
+    return { records: promised > 0 ? Math.min(promised, available) : available, promised };
+}
+
 function loadSTL(bytes) {
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const n = bytes.byteLength >= 84 ? dv.getUint32(80, true) : 0;
+    const warnings = [];
     let positions;
-    if (bytes.byteLength === 84 + n * 50 && n > 0) {
+    const bin = stlBinaryRecords(bytes);
+    if (bin) {
+        const n = bin.records;
+        if (bin.promised > n)
+            warnings.push(`File is truncated: showing ${n.toLocaleString()} of ${bin.promised.toLocaleString()} triangles`);
         positions = new Float32Array(n * 9);
         for (let i = 0; i < n; i++) {
             const o = 84 + i * 50 + 12;
             for (let k = 0; k < 9; k++) positions[i * 9 + k] = dv.getFloat32(o + k * 4, true);
         }
-    } else {
+    } else if (stlLooksAscii(bytes)) {
         const text = new TextDecoder().decode(bytes);
         const out = [];
         for (const m of text.matchAll(/vertex\s+(\S+)\s+(\S+)\s+(\S+)/g))
             out.push(+m[1], +m[2], +m[3]);
+        if (out.length % 9) throw new Error('malformed STL: incomplete triangle');
         positions = Float32Array.from(out);
+    } else {
+        positions = new Float32Array(0);
     }
     const indices = new Uint32Array(positions.length / 3);
     for (let i = 0; i < indices.length; i++) indices[i] = i;
     return {
         yUp: false,
+        warnings,
         plates: [{ name: 'Model' }],
         parts: [{ name: null, plate: 0, positions, indices, triColors: null, color: null }],
     };
@@ -509,7 +544,15 @@ function loadMPK(bytes) {
     if (new TextDecoder().decode(bytes.subarray(0, 4)) !== 'MPK1')
         throw new Error('not an MPK file');
     const len = dv.getUint32(4, true);
-    const head = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + len)));
+    let head;
+    try {
+        head = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + len)));
+    } catch (e) {
+        throw new Error('malformed MPK: bad header');
+    }
+    if (!Array.isArray(head?.parts)) throw new Error('malformed MPK: bad header');
+    const need = head.parts.reduce((t, p) => t + (Number.isInteger(p?.n) && p.n >= 0 ? p.n : NaN), 0) * 36;
+    if (!(8 + len + need <= bytes.byteLength)) throw new Error('malformed MPK: truncated');
     let off = 8 + len;
     const parts = head.parts.map((p) => {
         const count = p.n * 9;
@@ -530,10 +573,26 @@ function loadMPK(bytes) {
     return { yUp: false, plates: [{ name: 'Model' }], parts };
 }
 
+// Every loader's result passes through here: parts without triangles are dropped, and a model
+// with no triangles left, or with non-finite coordinates, is an error rather than an empty view.
+function validate(model) {
+    model.parts = model.parts.filter((p) => p.indices.length >= 3);
+    if (!model.parts.length) throw new Error('This file contains no geometry.');
+    for (const p of model.parts) {
+        if (p.indices.length % 3) throw new Error('malformed model: incomplete triangle');
+        const vertices = p.positions.length / 3;
+        for (let i = 0; i < p.indices.length; i++)
+            if (p.indices[i] >= vertices) throw new Error('malformed model: missing vertices');
+        for (let i = 0; i < p.positions.length; i++)
+            if (!Number.isFinite(p.positions[i])) throw new Error('malformed model: non-finite coordinate');
+    }
+    return model;
+}
+
 export async function loadModel(bytes, ext, fetchSibling) {
     ext = ext.toLowerCase();
-    if (ext === 'mpk') return loadMPK(bytes);
-    if (ext === '3mf') return load3MF(bytes);
-    if (ext === 'obj') return loadOBJ(bytes, fetchSibling);
-    return loadSTL(bytes);
+    if (ext === 'mpk') return validate(loadMPK(bytes));
+    if (ext === '3mf') return validate(load3MF(bytes));
+    if (ext === 'obj') return validate(await loadOBJ(bytes, fetchSibling));
+    return validate(loadSTL(bytes));
 }

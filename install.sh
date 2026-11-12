@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build oma-peek and install it for the current user:
-#   ~/.local/share/oma-peek/                 viewer page, CAD converter, uninstall script
-#   ~/.local/share/sushi/viewers/oma-peek.js  Sushi (Nautilus spacebar) viewer module
+#   ~/.local/share/oma-peek/                    viewer page, host, CAD converter, uninstall script
+#   ~/.local/share/sushi/plugins-1/oma-peek.js   Sushi 51+ (Nautilus spacebar) plugin
 #   ~/.local/share/thumbnailers/oma-peek.thumbnailer
 #   ~/.config/strata/actions/oma-peek/        Strata "Preview in oma-peek" action (if Strata is installed)
 #
@@ -13,30 +13,46 @@
 #   install.sh                  build and install
 #   install.sh --if-changed     same, but do nothing if this source is already installed
 #   install.sh --notify         also send a desktop notification on install / failure
+#   install.sh --managed        installed by the Omarchy plugin (Service.qml): the previews then
+#                               follow the plugin, and are removed when it is disabled or removed
+#                               (uninstall.sh --if-inactive); without it the install is manual
+#   install.sh --service        what the Omarchy plugin runs when the shell starts it:
+#                               --if-changed --notify --managed. Service.qml only ever passes this,
+#                               so what it means can change here (the shell may run a stale copy of
+#                               Service.qml after a plugin update until it restarts)
 #   install.sh --uninstall      remove everything installed above
 #   install.sh --payload FILE   only write the thumbnailer's python -c code to FILE (benchmarks)
 #
 # The Omarchy plugin (Service.qml) runs `install.sh --if-changed --notify` at shell start.
 # Nothing is ever written next to this script: the shell reloads a plugin whenever its
 # folder changes, so build outputs go to ~/.cache/oma-peek/build instead.
-set -euo pipefail
+#
+# Install state: the stamp ($runtime/.installed) holds the fingerprint of the inputs that were
+# installed. It is deleted before anything is replaced and written last, so an interrupted or
+# failed install is always retried by the next --if-changed run. install.sh and uninstall.sh
+# serialize on one lock outside every directory they remove.
+set -eEuo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 data="${XDG_DATA_HOME:-$HOME/.local/share}"
 runtime="$data/oma-peek"
 thumbnailers="$data/thumbnailers"
-viewers="$data/sushi/viewers"
+plugins="$data/sushi/plugins-1"
+legacy_viewer="$data/sushi/viewers/oma-peek.js"
 strata_config="${XDG_CONFIG_HOME:-$HOME/.config}/strata"
 build="${XDG_CACHE_HOME:-$HOME/.cache}/oma-peek/build"
+lock="${XDG_STATE_HOME:-$HOME/.local/state}/oma-peek/install.lock"
 
-if_changed=0 notify=0 payload_file=""
+if_changed=0 notify=0 managed=0 payload_file=""
 while (($#)); do
     case "$1" in
     --if-changed) if_changed=1 ;;
     --notify) notify=1 ;;
+    --managed) managed=1 ;;
+    --service) if_changed=1 notify=1 managed=1 ;;
     --uninstall) exec "$here/uninstall.sh" ;;
     --payload) payload_file="$2"; shift ;;
-    *) echo "usage: install.sh [--if-changed] [--notify] [--uninstall] [--payload FILE]" >&2; exit 2 ;;
+    *) echo "usage: install.sh [--service | --if-changed --notify --managed] [--uninstall] [--payload FILE]" >&2; exit 2 ;;
     esac
     shift
 done
@@ -45,22 +61,59 @@ notify() {
     ((notify)) && command -v notify-send >/dev/null && notify-send -a oma-peek "$@" || true
 }
 
-# Everything that affects what gets installed.
+# Everything that affects what gets installed: every source file (by relative name and
+# content), plus the parts of the system the install adapts to. WebKit 6 counts only as
+# present/absent: the plugin checks for it at run time, but the previewer must be restarted
+# (by a reinstall) to pick up a newly installed WebKit. openscad is looked up at preview time
+# and changes nothing installed, so it is not part of the fingerprint.
 fingerprint() {
-    (cd "$here" && cat install.sh uninstall.sh raster.c cad.cpp thumbnailer.py cflags ldlibs cad_ldlibs \
-        sushi/oma-peek.js $(find gjs strata web -type f | sort)) | sha1sum | cut -d' ' -f1
+    (
+        cd "$here"
+        find . -maxdepth 1 -type f \( -name '*.sh' -o -name '*.c' -o -name '*.cpp' -o -name '*.py' \
+            -o -name cflags -o -name ldlibs -o -name cad_ldlibs \) -print
+        find sushi gjs strata web -type f -print
+    ) | LC_ALL=C sort | while read -r f; do
+        printf '%s %s\n' "$f" "$(sha1sum <"$here/$f" | cut -d' ' -f1)"
+    done
+    printf 'arch %s\n' "$(uname -m)"
+    printf 'occt %s\n' "$(readlink -f /usr/lib/libTKernel.so 2>/dev/null || echo none)"
+    printf 'webkit6 %s\n' "$([ -e /usr/lib/girepository-1.0/WebKit-6.0.typelib ] && echo yes || echo no)"
+    printf 'strata %s\n' "$({ command -v strata >/dev/null || [ -d "$strata_config" ]; } && echo yes || echo no)"
+    printf 'managed %s %s\n' "$managed" "$( ((managed)) && echo "$here" || true)"
 }
+fingerprint_id() { fingerprint | sha1sum | cut -d' ' -f1; }
+
 stamp="$runtime/.installed"
-if ((if_changed)) && [ -z "$payload_file" ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$(fingerprint)" ]; then
+installed_ok() {
+    [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$1" ] &&
+        [ -f "$runtime/host.js" ] && [ -f "$runtime/web/index.html" ] &&
+        [ -f "$plugins/oma-peek.js" ] && [ -f "$thumbnailers/oma-peek.thumbnailer" ]
+}
+
+# Sushi builds its renderer table once per process, so a running previewer must restart to
+# pick up a new or removed plugin. Sushi 51 runs as `gjs -m`; older releases as plain `gjs`.
+restart_previewer() {
+    pkill -f '^/usr/bin/gjs( -m)? /usr/lib/org\.gnome\.NautilusPreviewer( |$)' 2>/dev/null || true
+}
+
+# One install or uninstall at a time. A second request waits, then re-checks the state, so
+# it is never dropped while the first one installs older sources.
+# Only the lock's own directory is created before locking: an uninstall holding the lock may
+# be removing everything else (the build directory included).
+mkdir -p "$(dirname "$lock")"
+exec 9>"$lock"
+flock -w 300 9 || { echo "oma-peek: timed out waiting for another install" >&2; exit 1; }
+mkdir -p "$build"
+
+if ((if_changed)) && [ -z "$payload_file" ] && installed_ok "$(fingerprint_id)"; then
     exit 0
 fi
 
-# One install at a time (a shell reload could start another while this one builds).
-mkdir -p "$build"
-exec 9>"$build/.lock"
-flock -n 9 || { echo "another oma-peek install is running" >&2; exit 0; }
-
 trap 'notify -u critical "oma-peek install failed" "Run $here/install.sh in a terminal to see why."' ERR
+
+install_once() {
+fp_start="$(fingerprint_id)"
+[ -z "$payload_file" ] && rm -f "$stamp"
 
 gcc $(cat "$here/cflags") -shared -s -o "$build/libmeshraster.so" "$here/raster.c" $(cat "$here/ldlibs")
 # OpenCASCADE-backed readers (STEP/IGES/glTF/OBJ): a library for the thumbnailer and a
@@ -105,19 +158,37 @@ print(f'wrote {dest} ({len(code)} byte payload)')
 EOF
 [ -n "$payload_file" ] && exit 0
 
-# Runtime files: real copies, so the plugin checkout can move or be removed freely.
-mkdir -p "$runtime" "$viewers"
-rm -rf "$runtime/web"
-cp -r "$here/web" "$runtime/web"
-if [ -f "$build/oma-peek-cad" ]; then
-    install -m755 "$build/oma-peek-cad" "$runtime/oma-peek-cad"
-else
-    rm -f "$runtime/oma-peek-cad"
+# Runtime files: real copies, so the plugin checkout can move or be removed freely. Staged
+# next to the live directory and swapped in, so a failed copy never leaves a half runtime.
+stage="$runtime.new"
+rm -rf "$stage" "$runtime.old"
+mkdir -p "$stage"
+cp -r "$here/web" "$stage/web"
+[ -f "$build/oma-peek-cad" ] && install -m755 "$build/oma-peek-cad" "$stage/oma-peek-cad"
+install -m755 "$here/uninstall.sh" "$stage/uninstall.sh"
+install -m644 "$here/gjs/host.js" "$here/gjs/oma-peek-open.js" "$stage/"
+install -m755 "$here/strata/oma-peek-open" "$stage/oma-peek-open"
+[ -d "$runtime" ] && mv "$runtime" "$runtime.old"
+mv "$stage" "$runtime"
+rm -rf "$runtime.old"
+
+mkdir -p "$plugins"
+install -m644 "$here/sushi/oma-peek.js" "$plugins/oma-peek.js.new"
+mv "$plugins/oma-peek.js.new" "$plugins/oma-peek.js"
+# Sushi 50 and older read viewers/; this release needs Sushi 51 (GTK4), so drop the old module.
+rm -f "$legacy_viewer"
+
+# Installed by the Omarchy plugin: record which plugin and which shell config decide whether
+# it is still wanted (read by uninstall.sh --if-inactive). A manual install has no record.
+if ((managed)); then
+    python3 -I - "$here/manifest.json" "$here" "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json" \
+        "$runtime/.managed" <<'PY'
+import json, sys
+manifest, plugin_dir, shell_config, dest = sys.argv[1:]
+plugin_id = json.load(open(manifest))['id']
+json.dump({'plugin_id': plugin_id, 'plugin_dir': plugin_dir, 'shell_config': shell_config}, open(dest, 'w'))
+PY
 fi
-install -m755 "$here/uninstall.sh" "$runtime/uninstall.sh"
-install -m644 "$here/gjs/omaPeekHost.js" "$here/gjs/oma-peek-open.js" "$runtime/"
-install -m755 "$here/strata/oma-peek-open" "$runtime/oma-peek-open"
-install -m644 "$here/sushi/oma-peek.js" "$viewers/oma-peek.js"
 
 # Strata has no preview plugins, so oma-peek joins its file menu as a custom action that
 # opens the viewer in its own window. Strata reads actions from disk when it builds a menu.
@@ -152,10 +223,34 @@ TOML
 fi
 
 # Let Nautilus retry files it previously failed to thumbnail; restart the previewer so
-# Sushi loads the new viewer module next time.
+# Sushi loads the new plugin next time.
 rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/thumbnails/fail/gnome-thumbnail-factory"
-pkill -f '^/usr/bin/gjs /usr/lib/org.gnome.NautilusPreviewer' 2>/dev/null || true
+restart_previewer
 
-fingerprint >"$stamp"
+# Stamp only the inputs that were actually installed: if a source changed while building,
+# leave the install unstamped (stale) and let the caller try again.
+if [ "$(fingerprint_id)" = "$fp_start" ]; then
+    echo "$fp_start" >"$stamp"
+    changed=0
+else
+    changed=1
+fi
+}
+
+# Called as a plain command (not in an `if`), so set -e still stops on any failure inside.
+for attempt in 1 2; do
+    install_once
+    ((changed)) || break
+    echo "oma-peek: sources changed during install (attempt $attempt)" >&2
+done
+if ((changed)); then
+    echo "oma-peek: sources keep changing; install left unstamped" >&2
+    exit 1
+fi
 echo "installed oma-peek"
-notify "oma-peek installed" "3D previews updated. Run 'nautilus -q' to load new thumbnails."
+if [ -e /usr/lib/girepository-1.0/WebKit-6.0.typelib ]; then
+    notify "oma-peek installed" "3D previews updated. Run 'nautilus -q' to load new thumbnails."
+else
+    echo "warning: webkitgtk-6.0 is not installed; thumbnails work but spacebar previews need it" >&2
+    notify "oma-peek installed (thumbnails only)" "Install webkitgtk-6.0 for spacebar 3D previews."
+fi

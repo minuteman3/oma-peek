@@ -59,8 +59,11 @@ Without the plugin system, clone the repository and run `./install.sh`.
 
 Required (all in the Arch repositories):
 
-- `nautilus` and `sushi` (Omarchy's file manager and its previewer)
+- `nautilus` and `sushi` 51 or newer (Omarchy's file manager and its previewer)
+- `webkitgtk-6.0` for the spacebar preview (without it you still get thumbnails)
 - `gcc` and `python`
+
+Sushi 50 and older (GTK3) load a different kind of plugin; oma-peek 0.2.0 supports those.
 
 Optional:
 
@@ -72,7 +75,7 @@ Optional:
 | `python-numpy` | fallback renderer used only if the native library can't load |
 
 ```sh
-sudo pacman -S --needed nautilus sushi gcc python opencascade openscad libdeflate
+sudo pacman -S --needed nautilus sushi webkitgtk-6.0 gcc python opencascade openscad libdeflate
 ```
 
 ### Strata
@@ -111,10 +114,12 @@ rm -rf ~/.cache/thumbnails/{normal,large,x-large,xx-large}/*
 
 ```sh
 omarchy plugin remove minuteman3.oma-peek
-~/.local/share/oma-peek/uninstall.sh
 ```
 
-Removing the plugin leaves the installed previews in place, so run `uninstall.sh` too.
+The previews follow the plugin: disabling or removing it removes the thumbnailer, the
+spacebar preview and their files a few seconds later, and enabling it again reinstalls them.
+A shell restart leaves them alone. An install made by running `./install.sh` yourself is not
+tied to the plugin; remove it with `~/.local/share/oma-peek/uninstall.sh`.
 
 ## How it works
 
@@ -131,19 +136,30 @@ from memory.
 - `thumbnailer.py`: format detection, 3MF project metadata (plates, objects, filament
   colours) and PNG output.
 
-**Spacebar preview.** Sushi loads extra viewer modules from `~/.local/share/sushi/viewers/`.
-`sushi/oma-peek.js` shows a three.js page (`web/`) in Sushi's WebKit view; `gjs/omaPeekHost.js`
-loads the model, and the Strata window (`gjs/oma-peek-open.js`) shares it. SCAD and CAD files
+**Spacebar preview.** Sushi 51 loads plugins from `~/.local/share/sushi/plugins-1/`.
+`sushi/oma-peek.js` is one: it shows a three.js page (`web/`) in a WebKitGTK 6.0 view.
+`gjs/host.js` runs each preview session (loading the page, converting, cancelling when the
+preview closes), and the Strata window (`gjs/oma-peek-open.js`) shares it. SCAD and CAD files
 are first converted to a mesh (`openscad`, or the `oma-peek-cad` converter built from
-`cad.cpp`) and cached in `~/.cache/oma-peek/`.
+`cad.cpp`). STEP, IGES and GLB results are cached in `~/.cache/oma-peek/models/`, keyed by the
+file's path, modification time, size and the installed version (entries unused for 30 days
+are dropped, and the cache is kept under 1 GiB, least recently used first); SCAD and `.gltf` files can
+pull in other files, so their results are kept only while the preview is open.
+
+**Installing.** `install.sh` records a fingerprint of everything it installed (sources plus
+the parts of the system it adapts to, such as OpenCASCADE and Strata) and `--if-changed` skips
+the work when nothing changed. Installs and uninstalls take a lock in
+`~/.local/state/oma-peek/`, an interrupted install is redone on the next run, and the running
+previewer is restarted so it loads the new plugin.
 
 Installed files:
 
 - `~/.local/share/thumbnailers/oma-peek.thumbnailer`
-- `~/.local/share/sushi/viewers/oma-peek.js`
-- `~/.local/share/oma-peek/`: viewer page, `oma-peek-cad`, `oma-peek-open`, `uninstall.sh`
+- `~/.local/share/sushi/plugins-1/oma-peek.js`
+- `~/.local/share/oma-peek/`: viewer page, `host.js`, `oma-peek-cad`, `oma-peek-open`, `uninstall.sh`
 - `~/.config/strata/actions/oma-peek/`: the Strata action, if Strata is installed
 - `~/.cache/oma-peek/`: build directory and converted meshes
+- `~/.local/state/oma-peek/install.lock`
 
 **Limitations.**
 
@@ -153,6 +169,9 @@ Installed files:
 - The <kbd>R</kbd> and plate-number shortcuts only work when the 3D view has keyboard focus,
   and Sushi doesn't always give it focus when the preview opens.
 - Very large STEP assemblies can take a few seconds to mesh the first time.
+- Binary STLs whose header triangle count is wrong (0, padding after the data, or a truncated
+  download) are read by their whole records, as slicers do; a truncated file is shown with a
+  warning.
 
 ## Development
 
@@ -160,7 +179,13 @@ Installed files:
 ./install.sh            # build and install from this checkout
 nautilus -q             # Nautilus reads the thumbnailer list only at startup
 OMA_PEEK_DEBUG=1 /usr/lib/org.gnome.NautilusPreviewer   # previewer with logging; then: sushi FILE
+tests/run.sh            # tests, against a throwaway install (never yours)
+tests/run.sh --acceptance   # also drive the real previewer and viewer windows (Hyprland)
 ```
+
+`tests/run.sh` needs `node` for the loader tests and a Wayland display for the GTK tests, and
+says which tests it skipped and why. The acceptance tier opens windows on the current
+workspace and presses keys in them, so leave the session alone while it runs.
 
 - `bench/e2e/run.py` times the exact installed thumbnailer over a folder of models in
   `bench/e2e/data/` (not included). `bench/bench.c` and `bench/check_raster.sh` cover the

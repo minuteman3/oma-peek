@@ -1,56 +1,62 @@
-// oma-peek: 3D model previews (STL, 3MF, OBJ, SCAD, STEP, IGES, glTF) for Sushi / Nautilus spacebar.
-// The viewer itself is a three.js page in ~/.local/share/oma-peek/web, loaded by the shared
-// ~/.local/share/oma-peek/omaPeekHost.js.
+// oma-peek: 3D model previews (STL, 3MF, OBJ, SCAD, STEP, IGES, glTF) for Sushi 51+, the
+// Nautilus spacebar previewer. Installed as ~/.local/share/sushi/plugins-1/oma-peek.js.
+// The viewer is a three.js page in ~/.local/share/oma-peek/web, driven by
+// ~/.local/share/oma-peek/host.js (kept out of plugins-1: Sushi imports every .js there).
 
-const {GLib, GObject} = imports.gi;
+import Adw from 'gi://Adw';
+import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
 
-const Renderer = imports.ui.renderer;
+import {Renderer} from 'resource://org/gnome/NautilusPreviewer/plugin-api-1.js';
 
-var Host;
+let Host = null;
 try {
-    let dir = GLib.build_filenamev([GLib.get_user_data_dir(), 'oma-peek']);
-    if (!imports.searchPath.includes(dir))
-        imports.searchPath.push(dir);
-    Host = imports.omaPeekHost;
+    const host = GLib.build_filenamev([GLib.get_user_data_dir(), 'oma-peek', 'host.js']);
+    Host = await import(GLib.filename_to_uri(host, null));
 } catch (e) {
+    console.warn(`oma-peek: runtime not installed (${e.message}); run install.sh`);
 }
 
-const available = Host !== undefined && Host.isAvailable();
+const available = Host?.isAvailable() ?? false;
+if (Host && !available)
+    console.warn('oma-peek: WebKitGTK 6.0 (webkitgtk-6.0) is not installed; 3D previews are off');
 
-var Klass = available ? GObject.registerClass({
-    Implements: [Renderer.Renderer],
-    Properties: {
-        fullscreen: GObject.ParamSpec.boolean('fullscreen', '', '',
-                                              GObject.ParamFlags.READABLE,
-                                              false),
-        ready: GObject.ParamSpec.boolean('ready', '', '',
-                                         GObject.ParamFlags.READABLE,
-                                         false),
-    },
-}, class MeshRenderer extends Host.WebKit2.WebView {
-    get ready() {
-        return !!this._ready;
+export const Klass = available ? class OmaPeekRenderer extends Host.WebKit.WebView {
+    static {
+        GObject.registerClass({
+            Implements: [Renderer],
+        }, this);
     }
 
-    get fullscreen() {
-        return !!this._fullscreen;
-    }
+    #session;
 
-    _init(file, fileInfo) {
-        super._init();
-
+    constructor(file, fileInfo, constructProperties = {}) {
+        super(constructProperties);
         Host.configureWebView(this);
-        this.connect('load-failed', (view, loadEvent, uri, error) => {
-            this.emit('error', error);
+        this.#session = new Host.Session(this, {
+            onReady: () => {
+                this.markReady();
+                this.grab_focus();
+            },
+            onFailed: (error) => this.markFailed(error),
         });
-
-        Host.loadModel(this, file, fileInfo ? fileInfo.get_content_type() : '');
-        this.isReady();
+        this.markInitialized();
+        this.#session.start(file, fileInfo?.get_content_type() ?? '');
     }
 
-    get moveOnClick() {
-        return false;
+    // Sushi calls stop() when the preview closes or moves on, even if this widget was never
+    // shown; cleanup() runs on unmap. Both end the session.
+    stop() {
+        this.#session.shutdown();
     }
-}) : undefined;
 
-var mimeTypes = available ? Host.mimeTypes() : [];
+    cleanup() {
+        this.#session.shutdown();
+    }
+
+    get topBarStyle() {
+        return Adw.ToolbarStyle.RAISED_BORDER;
+    }
+} : undefined;
+
+export const contentTypes = available ? Host.mimeTypes() : [];
