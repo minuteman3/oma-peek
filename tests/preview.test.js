@@ -81,6 +81,16 @@ function close(r) {
     close(r);
 }
 
+{
+    // A truncated binary STL is shown, with the warning in the info line.
+    const r = open(`${fixtures}/truncated.stl`);
+    let s = null;
+    await waitFor(async () => (s = await pageState(r).catch(() => null))?.msgHidden && /triangles/.test(s.info));
+    check(/\b12 triangles/.test(s?.info) && /truncated/i.test(s?.info) && /12 of 20/.test(s?.info),
+        'truncated STL: shown with a truncation warning', s?.info);
+    close(r);
+}
+
 // --- T3: lifecycle ------------------------------------------------------------------------
 {
     // (a) Stopped before the first page finished loading, never shown (Sushi does this when

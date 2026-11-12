@@ -229,6 +229,12 @@ function updateInfo() {
     const tris = vis.reduce((n, m) => n + m.userData.part.indices.length / 3, 0);
     const f = (v) => (v >= 100 ? v.toFixed(0) : v.toFixed(1));
     info.innerHTML = `<b>${dims.map(f).join(' × ')} mm</b> · ${tris.toLocaleString()} triangles`;
+    for (const w of model.warnings || []) {
+        const span = document.createElement('span');
+        span.className = 'warn';
+        span.textContent = w;
+        info.append(document.createElement('br'), span);
+    }
 }
 
 function button(label, { dot, count, active, dim, onClick, onHover }) {

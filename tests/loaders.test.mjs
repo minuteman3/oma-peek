@@ -39,6 +39,10 @@ for (const c of manifest) {
             return;
         }
         const m = await load(c);
+        if (c.warning)
+            assert.ok((m.warnings || []).some((w) => w.toLowerCase().includes(c.warning)), `warning mentioning "${c.warning}"`);
+        else
+            assert.deepEqual(m.warnings || [], [], 'no warnings');
         assert.equal(m.yUp, c.yUp);
         assert.deepEqual(m.plates.map((p) => p.name), c.plates);
         assert.equal(m.parts.length, c.parts.length, 'part count');

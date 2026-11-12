@@ -289,6 +289,63 @@ async function validateOutput(path, outExt, cancellable) {
     await checkFiniteFloats(path, 8 + len, triangles * 36, cancellable);
 }
 
+// --- cache upkeep ------------------------------------------------------------------------
+//
+// A cached mesh's modification time records when it was last used (set on every hit), so:
+//   Cached -hit-> Cached (last use = now)
+//   Cached -unused for CACHE_MAX_IDLE-> Evicted
+//   Cached -cache over CACHE_MAX_BYTES-> Evicted, least recently used first
+// An entry used within CACHE_IN_USE is never evicted: an open preview may still be reading it.
+// Temp files ('.'-prefixed) older than TEMP_MAX_AGE were left by a crashed previewer.
+// Pruning runs after each publication, the only time the cache grows.
+const CACHE_MAX_BYTES = 1024 * 1024 * 1024;
+const CACHE_MAX_IDLE = 30 * 24 * 3600;
+const CACHE_IN_USE = 10 * 60;
+const TEMP_MAX_AGE = 24 * 3600;
+
+function markUsed(path) {
+    try {
+        Gio.File.new_for_path(path).set_attribute_uint64('time::modified', Math.floor(Date.now() / 1000),
+            Gio.FileQueryInfoFlags.NONE, null);
+    } catch (e) {
+        // a read-only cache still works; it just ages by publication time
+    }
+}
+
+function pruneCache() {
+    let entries;
+    try {
+        const e = Gio.File.new_for_path(CACHE_DIR).enumerate_children(
+            'standard::name,standard::size,standard::type,time::modified', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
+        entries = [...e].filter((i) => i.get_file_type() === Gio.FileType.REGULAR).map((i) => ({
+            name: i.get_name(), size: i.get_size(), used: i.get_attribute_uint64('time::modified'),
+        }));
+    } catch (e) {
+        return;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const remove = (name) => unlinkQuietly(GLib.build_filenamev([CACHE_DIR, name]));
+    const kept = [];
+    for (const entry of entries) {
+        const age = now - entry.used;
+        if (entry.name.startsWith('.'))
+            age > TEMP_MAX_AGE && remove(entry.name);
+        else if (age > CACHE_MAX_IDLE)
+            remove(entry.name);
+        else
+            kept.push(entry);
+    }
+    let total = kept.reduce((t, x) => t + x.size, 0);
+    for (const entry of kept.sort((a, b) => a.used - b.used)) {
+        if (total <= CACHE_MAX_BYTES)
+            break;
+        if (now - entry.used <= CACHE_IN_USE)
+            continue;
+        remove(entry.name);
+        total -= entry.size;
+    }
+}
+
 // Resolves to {path, temporary}; temporary outputs belong to the caller.
 async function convert(file, conversion, cancellable, attempts = 2) {
     const path = file.get_path();
@@ -298,8 +355,10 @@ async function convert(file, conversion, cancellable, attempts = 2) {
     const key = GLib.compute_checksum_for_string(GLib.ChecksumType.SHA1,
         JSON.stringify([path, identity, converterIdentity()]), -1);
     const out = GLib.build_filenamev([CACHE_DIR, `${key}.${conversion.outExt}`]);
-    if (conversion.persistent && GLib.file_test(out, GLib.FileTest.EXISTS))
+    if (conversion.persistent && GLib.file_test(out, GLib.FileTest.EXISTS)) {
+        markUsed(out);
         return {path: out, temporary: false};
+    }
 
     // This attempt owns tmp until it is published or handed to the caller; any other way
     // out (error, cancellation, the source changing or vanishing) removes it.
@@ -324,6 +383,7 @@ async function convert(file, conversion, cancellable, attempts = 2) {
                 throw new Error(`could not save the converted file: ${e.message}`);
             }
             owned = false;
+            pruneCache();
             return {path: out, temporary: false};
         }
     } finally {

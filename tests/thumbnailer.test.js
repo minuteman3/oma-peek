@@ -68,6 +68,9 @@ if (noOcct) {
 } else {
     expectImage(`${fixtures}/box-binary.stl`, 'model/stl', 'binary STL');
     expectImage(`${fixtures}/box-ascii.stl`, 'model/stl', 'ASCII STL');
+    // Binary STLs as found in the wild (see tests/fixtures/models.py).
+    for (const f of ['count-zero', 'padded', 'truncated', 'solid-header-binary', 'crlf-ascii'])
+        expectImage(`${fixtures}/${f}.stl`, 'model/stl', `STL ${f}`);
     expectImage(`${fixtures}/bambu-plates.3mf`, 'model/3mf', '3MF with plates');
     expectImage(`${fixtures}/two-groups.obj`, 'model/obj', 'OBJ');
     expectImage(`${fixtures}/thumb-only.3mf`, 'model/3mf', '3MF without geometry (embedded preview)');
@@ -75,7 +78,9 @@ if (noOcct) {
         expectImage(`${cad}/assembly.step`, 'model/step', 'STEP');
     else
         print('# skip: STEP case (no CAD_FIXTURES)');
-    const garbage = thumbnail(`${fixtures}/garbage.stl`, 'model/stl');
-    check(garbage.registered && !garbage.pixbuf, 'garbage STL: no thumbnail (Nautilus keeps the icon)');
+    for (const f of ['garbage', 'notes']) {
+        const r = thumbnail(`${fixtures}/${f}.stl`, 'model/stl');
+        check(r.registered && !r.pixbuf, `${f}.stl (not an STL): no thumbnail (Nautilus keeps the icon)`);
+    }
 }
 finish(system);

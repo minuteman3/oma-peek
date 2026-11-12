@@ -51,13 +51,26 @@ LIGHT = (0.35, -0.55, 0.9)
 
 # --- geometry loaders: return list of parts {tris: (n,3,3) float32, colour, plate} ---
 
+def stl_records(data):
+    """Binary STL record count, or 0 for ASCII / not an STL. Same rule as web/loaders.js
+    stlBinaryRecords and raster.c stl_records."""
+    if len(data) < 84 + 50:
+        return 0
+    n = int.from_bytes(data[80:84], 'little')
+    available = (len(data) - 84) // 50
+    if n and len(data) == 84 + 50 * n:
+        return n
+    if b'\0' not in data[84:84 + 50 * 20]:
+        return 0
+    return min(n, available) if n else available
+
+
 def load_stl(data):
-    if len(data) >= 84:
-        n = int.from_bytes(data[80:84], 'little')
-        if n and len(data) == 84 + 50 * n:
-            rec = np.frombuffer(data, dtype=np.dtype([('n', '<f4', 3), ('v', '<f4', (3, 3)), ('a', '<u2')]),
-                                count=n, offset=84)
-            return [dict(tris=rec['v'].astype(np.float32), colour=None, plate=0)]
+    n = stl_records(data)
+    if n:
+        rec = np.frombuffer(data, dtype=np.dtype([('n', '<f4', 3), ('v', '<f4', (3, 3)), ('a', '<u2')]),
+                            count=n, offset=84)
+        return [dict(tris=rec['v'].astype(np.float32), colour=None, plate=0)]
     nums = re.findall(rb'vertex\s+(\S+)\s+(\S+)\s+(\S+)', data)
     v = np.array(nums, dtype=np.float64).astype(np.float32).reshape(-1, 3, 3)
     return [dict(tris=v, colour=None, plate=0)]

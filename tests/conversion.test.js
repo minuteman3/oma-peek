@@ -281,6 +281,57 @@ for (const mode of ['short', 'badmpk', 'truncmpk', 'nanmpk']) {
     GLib.file_set_contents(stamp, old);
 }
 
+// Cache upkeep: idle entries and crash leftovers are removed, and the cache is kept under its
+// size budget by evicting the least recently used entries, never ones used in the last few
+// minutes. Big entries are sparse files: same apparent size, no disk space.
+{
+    const now = Math.floor(Date.now() / 1000);
+    const fake = (name, mb, ageSeconds) => {
+        const path = `${cache}/${name}`;
+        GLib.spawn_command_line_sync(`truncate -s ${mb}M ${GLib.shell_quote(path)}`);
+        GLib.spawn_command_line_sync(`touch -d @${now - ageSeconds} ${GLib.shell_quote(path)}`);
+        return name;
+    };
+    const hex = (c) => c.repeat(40);
+    const has = (name) => exists(`${cache}/${name}`);
+    const publishSomething = async () => {
+        const p = open(source('step'));
+        await waitFor(() => settled(p));
+        p.session.shutdown();
+        return pageParams(p.view)?.file;
+    };
+
+    // A real entry, made the oldest, then used again: the hit must count as recent use.
+    const src = source('step');
+    const first = open(src);
+    await waitFor(() => settled(first));
+    first.session.shutdown();
+    const used = pageParams(first.view).file.split('/').pop();
+    GLib.spawn_command_line_sync(`touch -d @${now - 6 * 3600} ${GLib.shell_quote(`${cache}/${used}`)}`);
+    const hit = open(src);
+    await waitFor(() => settled(hit));
+    hit.session.shutdown();
+
+    const idle = fake(`${hex('1')}.mpk`, 1, 40 * 24 * 3600);
+    const staleTemp = fake(`.${hex('2')}.crashed.mpk`, 1, 2 * 24 * 3600);
+    const freshTemp = fake(`.${hex('3')}.converting.mpk`, 1, 60);
+    const a = fake(`${hex('a')}.mpk`, 400, 5 * 3600);
+    const b = fake(`${hex('b')}.mpk`, 400, 4 * 3600);
+    const c = fake(`${hex('c')}.mpk`, 400, 3 * 3600);
+    await publishSomething();
+    check(!has(idle), 'cache: an entry unused for 30 days is removed');
+    check(!has(staleTemp) && has(freshTemp), 'cache: day-old temp files are removed, fresh ones kept');
+    check(!has(a) && has(b) && has(c), 'cache: over budget, the least recently used entry goes first, and only as many as needed');
+    check(has(used), 'cache: a cache hit counts as recent use');
+
+    const inUse = fake(`${hex('d')}.mpk`, 900, 60);
+    await publishSomething();
+    check(!has(b) && !has(c), 'cache: still over budget, older entries keep going');
+    check(has(inUse), 'cache: an entry used in the last minutes is never evicted');
+    for (const name of [freshTemp, inUse])
+        GLib.unlink(`${cache}/${name}`);
+}
+
 // Inputs that can depend on other files are converted per session and never cached.
 for (const [ext, label] of [['gltf', '.gltf'], ['scad', 'SCAD']]) {
     const before = visible();

@@ -121,6 +121,8 @@ else
     run_test system "thumbnailer (T6)" skip_test "unprivileged namespaces unavailable"
 fi
 
+run_test system "thumbnailer numpy fallback (T6b)" env FIXTURES="$fixtures" bash "$repo/tests/thumbnailer-fallback.test.sh"
+
 # --- display tier -----------------------------------------------------------------------------
 display_test() { # display_test NAME COMMAND...
     if ! ((display)); then run_test display "$1" skip_test "no Wayland display"; return; fi

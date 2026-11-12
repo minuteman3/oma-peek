@@ -654,14 +654,30 @@ long mp_emit(const float *v, long nv, const int64_t *t, long nt, const double *m
 
 // Binary STL straight from the file bytes. Returns -3 if it isn't binary STL
 // (the caller then uses the general path, e.g. for ASCII STL).
+// Number of 50-byte records to read from a binary STL, or 0 if the data isn't one (ASCII or
+// not an STL). Same rule as web/loaders.js stlBinaryRecords: exact size match; otherwise a
+// NUL byte in the first 20 records marks binary data, read as the whole records the header
+// promises and the file holds (all of them when the header count is 0).
+static long stl_records(const uint8_t *data, long len)
+{
+    if (len < 84 + 50)
+        return 0;
+    uint32_t n;
+    memcpy(&n, data + 80, 4);
+    long available = (len - 84) / 50;
+    if (n > 0 && (long)n * 50 + 84 == len)
+        return n;
+    long probe = len < 84 + 50 * 20 ? len - 84 : 50 * 20;
+    if (!memchr(data + 84, 0, (size_t)probe))
+        return 0;
+    return n > 0 && (long)n < available ? (long)n : available;
+}
+
 int mp_thumb_stl(const uint8_t *data, long len, const uint8_t *colour, int size,
                  const double *view, const double *light, uint8_t *raw)
 {
-    if (len < 84)
-        return -3;
-    uint32_t n;
-    memcpy(&n, data + 80, 4);
-    if (n == 0 || n > INT32_MAX || (long)n * 50 + 84 != len)
+    long n = stl_records(data, len);
+    if (n <= 0 || n > INT32_MAX)
         return -3;
     // Render straight from the 50-byte records (normal, 3 vertices, attribute).
     uint8_t *small = malloc((size_t)size * size * 4);

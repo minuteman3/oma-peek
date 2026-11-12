@@ -123,6 +123,33 @@ cases += [
     {'file': 'nan-binary.stl', 'ext': 'stl', 'error': 'malformed'},
 ]
 
+# Binary STLs as found in the wild: header count of 0 (streaming exporters), padding after
+# the last record, a header promising more records than the file holds (truncated download),
+# and a binary file whose 80-byte header starts with "solid". All are read by their whole
+# 50-byte records; a truncated file is shown with a warning.
+def stl_binary_bytes(tris, count, header=b'', tail=b''):
+    body = b''.join(struct.pack('<3f', 0, 0, 0) + b''.join(struct.pack('<3f', *p) for p in t) + b'\0\0'
+                    for t in tris)
+    return header.ljust(80, b' ') + struct.pack('<I', count) + body + tail
+
+def write_bytes(name, data):
+    with open(os.path.join(OUT, name), 'wb') as f:
+        f.write(data)
+
+write_bytes('count-zero.stl', stl_binary_bytes(box(*B), 0))
+write_bytes('padded.stl', stl_binary_bytes(box(*B), 12, tail=b'\0' * 7))
+write_bytes('truncated.stl', stl_binary_bytes(box(*B), 20))          # 12 records present
+write_bytes('solid-header-binary.stl', stl_binary_bytes(box(*B), 12, header=b'solid exported by CAD'))
+write_text('crlf-ascii.stl', stl_ascii(box(*B)).replace('\n', '\r\n'))
+for f in ('count-zero.stl', 'padded.stl', 'solid-header-binary.stl', 'crlf-ascii.stl'):
+    cases.append({'file': f, 'ext': 'stl', 'yUp': False, 'plates': ['Model'],
+                  'parts': [part(None, 12, bbox(*B))]})
+cases.append({'file': 'truncated.stl', 'ext': 'stl', 'yUp': False, 'plates': ['Model'],
+              'parts': [part(None, 12, bbox(*B))], 'warning': 'truncated'})
+# Plain text that is not an STL must not be read as binary records.
+write_text('notes.stl', 'These are my notes about a print. ' * 20)
+cases.append({'file': 'notes.stl', 'ext': 'stl', 'error': 'no geometry'})
+
 # --- OBJ (+ mtl), quads fan-triangulated, two named groups -------------------------------
 
 def obj_box(sx, sy, sz, ox, oy, oz, base):

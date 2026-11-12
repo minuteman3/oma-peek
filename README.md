@@ -140,7 +140,8 @@ from memory.
 preview closes), and the Strata window (`gjs/oma-peek-open.js`) shares it. SCAD and CAD files
 are first converted to a mesh (`openscad`, or the `oma-peek-cad` converter built from
 `cad.cpp`). STEP, IGES and GLB results are cached in `~/.cache/oma-peek/models/`, keyed by the
-file's path, modification time, size and the installed version; SCAD and `.gltf` files can
+file's path, modification time, size and the installed version (entries unused for 30 days
+are dropped, and the cache is kept under 1 GiB, least recently used first); SCAD and `.gltf` files can
 pull in other files, so their results are kept only while the preview is open.
 
 **Installing.** `install.sh` records a fingerprint of everything it installed (sources plus
@@ -166,6 +167,9 @@ Installed files:
 - The <kbd>R</kbd> and plate-number shortcuts only work when the 3D view has keyboard focus,
   and Sushi doesn't always give it focus when the preview opens.
 - Very large STEP assemblies can take a few seconds to mesh the first time.
+- Binary STLs whose header triangle count is wrong (0, padding after the data, or a truncated
+  download) are read by their whole records, as slicers do; a truncated file is shown with a
+  warning.
 
 ## Development
 
